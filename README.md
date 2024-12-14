@@ -35,6 +35,6 @@ MEDIX é um sistema de gestão de produtos e vendas desenvolvido em Python utili
 1. Clone o repositório
 
 ```bash
-git clone https://github.com/seu-usuario/medix-gestao.git
-cd medix-gestao
+git clone [https://github.com/AllanCardosoDev/medix_gestao]
+cd medix_gestao
 ```
