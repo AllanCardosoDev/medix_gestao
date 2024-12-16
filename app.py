@@ -439,10 +439,10 @@ def listar_produtos_ui(gestao):
                     if row['tipo'] in ['PDF', 'Serviço Digital']:
                         st.write(f"**Link de download:** {row['link_download']}")
                 with col2:
-                    if st.button(f"Editar {row['nome']}"):
+                    if st.button(f"Editar {row['nome']}", key=f"edit_{row['id']}"):
                         st.session_state.editing_product = row['id']
                 with col3:
-                    if st.button(f"Remover {row['nome']}"):
+                    if st.button(f"Remover {row['nome']}", key=f"remove_{row['id']}"):
                         if gestao.remover_produto(row['id']):
                             st.success(f"Produto {row['nome']} removido com sucesso!")
                             st.rerun()
@@ -452,11 +452,14 @@ def listar_produtos_ui(gestao):
         if 'editing_product' in st.session_state:
             produto = produtos[produtos['id'] == st.session_state.editing_product].iloc[0]
             st.subheader(f"Editando: {produto['nome']}")
-            with st.form("editar_produto"):
+            with st.form(key=f"edit_product_{produto['id']}"):
                 nome = st.text_input("Nome do Produto", value=produto['nome'])
                 tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Físico", "Serviço Digital"], index=["PDF", "Card", "Físico", "Serviço Digital"].index(produto['tipo']))
                 valor = st.number_input("Valor", min_value=0.0, value=float(produto['valor']), step=0.01)
-                quantidade = st.number_input("Quantidade", min_value=0, value=int(produto['quantidade'] or 0), step=1)
+                
+                quantidade_valor = produto['quantidade'] if pd.notna(produto['quantidade']) else 0
+                quantidade = st.number_input("Quantidade", min_value=0, value=int(quantidade_valor), step=1)
+                
                 link_download = st.text_input("Link de Download", value=produto['link_download'] if pd.notna(produto['link_download']) else "")
                 descricao = st.text_area("Descrição", value=produto['descricao'] if pd.notna(produto['descricao']) else "")
                 
@@ -488,10 +491,10 @@ def listar_vendas_ui(gestao):
                     st.write(f"**CPF:** {row['cpf_cliente'] or 'Não informado'}")
                     st.write(f"**Email:** {row['email_cliente'] or 'Não informado'}")
                 with col2:
-                    if st.button(f"Editar Venda {row['id']}"):
+                    if st.button(f"Editar Venda {row['id']}", key=f"edit_venda_{row['id']}"):
                         st.session_state.editing_sale = row['id']
                 with col3:
-                    if st.button(f"Remover Venda {row['id']}"):
+                    if st.button(f"Remover Venda {row['id']}", key=f"remove_venda_{row['id']}"):
                         if gestao.remover_venda(row['id']):
                             st.success(f"Venda {row['id']} removida com sucesso!")
                             st.rerun()
@@ -501,7 +504,7 @@ def listar_vendas_ui(gestao):
         if 'editing_sale' in st.session_state:
             venda = vendas[vendas['id'] == st.session_state.editing_sale].iloc[0]
             st.subheader(f"Editando Venda: {venda['id']}")
-            with st.form("editar_venda"):
+            with st.form(key=f"edit_sale_{venda['id']}"):
                 produtos = gestao.listar_produtos()
                 opcoes_produtos = dict(zip(produtos['nome'], produtos['id']))
                 produto_selecionado = st.selectbox("Produto", list(opcoes_produtos.keys()), index=list(opcoes_produtos.keys()).index(venda['produto']))
