@@ -8,6 +8,9 @@ import openpyxl
 
 def validar_cpf(cpf):
     """Validação básica de CPF"""
+    if not cpf or cpf == '00000000000':
+        return True  # CPF vazio ou com zeros é considerado válido
+    
     cpf = re.sub(r'\D', '', cpf)
     
     if len(cpf) != 11:
@@ -31,6 +34,8 @@ def validar_cpf(cpf):
 
 def formatar_cpf(cpf):
     """Formata o CPF com pontos e traço"""
+    if not cpf or cpf == '00000000000':
+        return cpf
     cpf = re.sub(r'\D', '', cpf)
     return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
 
@@ -80,7 +85,7 @@ class GestaoVendas:
                 id INTEGER PRIMARY KEY,
                 produto_id INTEGER,
                 cliente TEXT NOT NULL,
-                cpf_cliente TEXT NOT NULL,
+                cpf_cliente TEXT,
                 email_cliente TEXT,
                 quantidade INTEGER,
                 valor_total REAL,
@@ -148,10 +153,10 @@ class GestaoVendas:
     def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
         cursor = self.conn.cursor()
         
-        if not validar_cpf(cpf):
-            raise ValueError("CPF inválido")
+        if cpf and not validar_cpf(cpf):
+            st.warning("CPF inválido. A venda será registrada, mas verifique o CPF.")
         
-        cpf_formatado = formatar_cpf(cpf)
+        cpf_formatado = formatar_cpf(cpf) if cpf else None
         
         cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
         produto = cursor.fetchone()
@@ -200,10 +205,10 @@ class GestaoVendas:
     def editar_venda(self, id, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
         cursor = self.conn.cursor()
         try:
-            if not validar_cpf(cpf):
-                raise ValueError("CPF inválido")
+            if cpf and not validar_cpf(cpf):
+                st.warning("CPF inválido. A venda será atualizada, mas verifique o CPF.")
             
-            cpf_formatado = formatar_cpf(cpf)
+            cpf_formatado = formatar_cpf(cpf) if cpf else None
             
             # Obter informações da venda atual
             cursor.execute('SELECT produto_id, quantidade FROM vendas WHERE id = ?', (id,))
@@ -373,7 +378,7 @@ def registrar_venda_ui(gestao):
                 )
                 
                 cliente = st.text_input("Nome do Cliente")
-                cpf = st.text_input("CPF do Cliente", help="Digite apenas números")
+                cpf = st.text_input("CPF do Cliente (opcional)", help="Digite apenas números ou deixe em branco")
                 email = st.text_input("Email do Cliente")
             
             with col2:
@@ -403,10 +408,6 @@ def registrar_venda_ui(gestao):
                 try:
                     if not cliente:
                         st.error("Nome do cliente é obrigatório")
-                        st.stop()
-                    
-                    if not cpf:
-                        st.error("CPF do cliente é obrigatório")
                         st.stop()
                     
                     produto_id = opcoes_produtos[produto_selecionado]
@@ -484,8 +485,8 @@ def listar_vendas_ui(gestao):
                     st.write(f"**Valor Total:** R$ {row['valor_total']:.2f}")
                     st.write(f"**Data da Compra:** {row['data_compra']}")
                     st.write(f"**Forma de Pagamento:** {row['forma_pagamento']}")
-                    st.write(f"**CPF:** {row['cpf_cliente']}")
-                    st.write(f"**Email:** {row['email_cliente']}")
+                    st.write(f"**CPF:** {row['cpf_cliente'] or 'Não informado'}")
+                    st.write(f"**Email:** {row['email_cliente'] or 'Não informado'}")
                 with col2:
                     if st.button(f"Editar Venda {row['id']}"):
                         st.session_state.editing_sale = row['id']
@@ -505,8 +506,8 @@ def listar_vendas_ui(gestao):
                 opcoes_produtos = dict(zip(produtos['nome'], produtos['id']))
                 produto_selecionado = st.selectbox("Produto", list(opcoes_produtos.keys()), index=list(opcoes_produtos.keys()).index(venda['produto']))
                 cliente = st.text_input("Nome do Cliente", value=venda['cliente'])
-                cpf = st.text_input("CPF do Cliente", value=venda['cpf_cliente'])
-                email = st.text_input("Email do Cliente", value=venda['email_cliente'])
+                cpf = st.text_input("CPF do Cliente (opcional)", value=venda['cpf_cliente'] if venda['cpf_cliente'] else "")
+                email = st.text_input("Email do Cliente", value=venda['email_cliente'] if venda['email_cliente'] else "")
                 quantidade = st.number_input("Quantidade", min_value=1, value=int(venda['quantidade']))
                 forma_pagamento = st.selectbox("Forma de Pagamento", ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"], index=["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"].index(venda['forma_pagamento']))
                 data_compra = st.date_input("Data da Compra", value=datetime.strptime(venda['data_compra'], '%Y-%m-%d').date() if venda['data_compra'] else datetime.now())
