@@ -456,7 +456,7 @@ def listar_produtos_ui(gestao):
                 nome = st.text_input("Nome do Produto", value=produto['nome'])
                 tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Físico", "Serviço Digital"], index=["PDF", "Card", "Físico", "Serviço Digital"].index(produto['tipo']))
                 valor = st.number_input("Valor", min_value=0.0, value=float(produto['valor']), step=0.01)
-                quantidade = st.number_input("Quantidade", min_value=0, value=int(produto['quantidade']) if produto['quantidade'] else 0, step=1)
+                quantidade = st.number_input("Quantidade", min_value=0, value=int(produto['quantidade'] or 0), step=1)
                 link_download = st.text_input("Link de Download", value=produto['link_download'] if produto['link_download'] else "")
                 descricao = st.text_area("Descrição", value=produto['descricao'] if produto['descricao'] else "")
                 
