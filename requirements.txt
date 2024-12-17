@@ -6,5 +6,4 @@ google-auth-oauthlib==1.0.0
 google-auth-httplib2==0.1.0
 google-api-python-client==2.86.0
 gspread==5.7.2
-Pillow==9.5.0
 gspread-dataframe==3.3.1
