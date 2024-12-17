@@ -8,6 +8,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import gspread
+from gspread_dataframe import set_with_dataframe
 
 # Configuração das credenciais do Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -16,8 +17,8 @@ SERVICE_ACCOUNT_FILE = 'path/to/your/service_account_file.json'  # Você precisa
 creds = service_account.Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
-# ID da sua planilha do Google Sheets
-SPREADSHEET_ID = 'your_spreadsheet_id_here'
+# Nome da planilha
+SPREADSHEET_NAME = "MEDIX_Gestao_Vendas"
 
 def validar_cpf(cpf):
     if not cpf or cpf == '00000000000':
@@ -45,9 +46,22 @@ def formatar_cpf(cpf):
 
 class GestaoVendas:
     def __init__(self):
-        self.sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
-        self.produtos_sheet = self.sheet.worksheet("Produtos")
-        self.vendas_sheet = self.sheet.worksheet("Vendas")
+        self.client = gspread.authorize(creds)
+        self.sheet = self.get_or_create_spreadsheet()
+        self.produtos_sheet = self.get_or_create_worksheet("Produtos")
+        self.vendas_sheet = self.get_or_create_worksheet("Vendas")
+
+    def get_or_create_spreadsheet(self):
+        try:
+            return self.client.open(SPREADSHEET_NAME)
+        except gspread.SpreadsheetNotFound:
+            return self.client.create(SPREADSHEET_NAME)
+
+    def get_or_create_worksheet(self, name):
+        try:
+            return self.sheet.worksheet(name)
+        except gspread.WorksheetNotFound:
+            return self.sheet.add_worksheet(title=name, rows="1000", cols="20")
 
     def cadastrar_produto(self, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
         try:
@@ -464,13 +478,13 @@ def main():
     .sidebar .sidebar-content {
         background-color: #f0f2f6;
     }
-    .sidebar .sidebar-content .stRadio > div {
+    .sidebar .sidebar-content .stSelectbox {
         background-color: #ffffff;
         padding: 10px;
         border-radius: 5px;
         margin-bottom: 10px;
     }
-    .sidebar .sidebar-content .stRadio > div:hover {
+    .sidebar .sidebar-content .stSelectbox:hover {
         background-color: #e6e9ef;
     }
     .big-font {
@@ -500,27 +514,18 @@ def main():
     
     gestao = st.session_state.gestao
 
-    menu = st.sidebar.radio("Navegação", [
-        "📦 Cadastrar Produto", 
-        "💳 Registrar Venda", 
-        "📋 Listar Produtos", 
-        "📊 Listar Vendas",
-        "📤 Exportar Dados",
-        "👀 Visualizar Planilha"
-    ])
+    menu_options = {
+        "📦 Cadastrar Produto": cadastrar_produto_ui,
+        "💳 Registrar Venda": registrar_venda_ui,
+        "📋 Listar Produtos": listar_produtos_ui,
+        "📊 Listar Vendas": listar_vendas_ui,
+        "📤 Exportar Dados": exportar_dados_ui,
+        "👀 Visualizar Planilha": visualizar_planilha_ui
+    }
 
-    if menu == "📦 Cadastrar Produto":
-        cadastrar_produto_ui(gestao)
-    elif menu == "💳 Registrar Venda":
-        registrar_venda_ui(gestao)
-    elif menu == "📋 Listar Produtos":
-        listar_produtos_ui(gestao)
-    elif menu == "📊 Listar Vendas":
-        listar_vendas_ui(gestao)
-    elif menu == "📤 Exportar Dados":
-        exportar_dados_ui(gestao)
-    elif menu == "👀 Visualizar Planilha":
-        visualizar_planilha_ui(gestao)
+    menu = st.sidebar.selectbox("Navegação", list(menu_options.keys()))
+
+    menu_options[menu](gestao)
 
 if __name__ == "__main__":
     main()
