@@ -1,8 +1,5 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-import re
-import io
 import openpyxl
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -10,6 +7,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import gspread
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
+import io
+from datetime import datetime
+import re
 
 # Configuração das credenciais do Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
