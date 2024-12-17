@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
+import json
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 import gspread
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from datetime import datetime
@@ -11,13 +11,13 @@ import io
 
 # Configuração Inicial do Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = "google_sheets_credentials.json"  # Arquivo de credenciais JSON
 SPREADSHEET_NAME = "MEDIX_Gestao_Vendas"
 
-# Credenciais do Google
+# Carregar credenciais do Streamlit Secrets
 @st.cache_resource
 def get_credentials():
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    credentials = st.secrets["google_sheets_credentials"]
+    creds = Credentials.from_service_account_info(json.loads(credentials))
     return gspread.authorize(creds)
 
 def validar_cpf(cpf):
