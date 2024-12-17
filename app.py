@@ -7,9 +7,12 @@ import io
 import openpyxl
 import os
 import shutil
+import zipfile
 
 # Funções auxiliares
 def validar_cpf(cpf):
+    if not cpf:
+        return True  # CPF vazio é considerado válido, pois não é mais obrigatório
     cpf = re.sub(r'\D', '', cpf)
     if len(cpf) != 11 or len(set(cpf)) == 1:
         return False
@@ -26,11 +29,14 @@ def validar_cpf(cpf):
     return int(cpf[10]) == digito
 
 def formatar_cpf(cpf):
+    if not cpf:
+        return ""
     cpf = re.sub(r'\D', '', cpf)
     return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
 
 class GestaoVendas:
     def __init__(self, db_name='medix_vendas.db'):
+        self.db_name = db_name
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
         self.migrar_banco_dados()
         self.criar_tabelas()
@@ -66,7 +72,7 @@ class GestaoVendas:
                 id INTEGER PRIMARY KEY,
                 produto_id INTEGER,
                 cliente TEXT NOT NULL,
-                cpf_cliente TEXT NOT NULL,
+                cpf_cliente TEXT,
                 email_cliente TEXT,
                 quantidade INTEGER,
                 valor_total REAL,
@@ -130,15 +136,15 @@ class GestaoVendas:
 
     def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
         cursor = self.conn.cursor()
-        if not validar_cpf(cpf):
+        if cpf and not validar_cpf(cpf):
             raise ValueError("CPF inválido")
-        cpf_formatado = formatar_cpf(cpf)
+        cpf_formatado = formatar_cpf(cpf) if cpf else None
         cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
         produto = cursor.fetchone()
         if not produto:
             raise ValueError("Produto não encontrado")
         valor_unitario, tipo_produto, estoque_atual = produto
-        if tipo_produto in ['Card', 'Físico'] and (estoque_atual is None or quantidade > estoque_atual):
+        if tipo_produto in ['Card', 'Material Físico'] and (estoque_atual is None or quantidade > estoque_atual):
             raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual or 0}")
         valor_total = valor_unitario * quantidade
         data_registro = datetime.now()
@@ -151,7 +157,7 @@ class GestaoVendas:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (produto_id, cliente, cpf_formatado, email, quantidade, 
               valor_total, forma_pagamento, data_registro, data_compra))
-        if tipo_produto in ['Card', 'Físico']:
+        if tipo_produto in ['Card', 'Material Físico']:
             cursor.execute('''
                 UPDATE produtos 
                 SET quantidade = quantidade - ? 
@@ -163,9 +169,9 @@ class GestaoVendas:
     def editar_venda(self, id, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
         cursor = self.conn.cursor()
         try:
-            if not validar_cpf(cpf):
+            if cpf and not validar_cpf(cpf):
                 raise ValueError("CPF inválido")
-            cpf_formatado = formatar_cpf(cpf)
+            cpf_formatado = formatar_cpf(cpf) if cpf else None
             cursor.execute('SELECT produto_id, quantidade FROM vendas WHERE id = ?', (id,))
             venda_atual = cursor.fetchone()
             if not venda_atual:
@@ -176,7 +182,7 @@ class GestaoVendas:
             if not produto:
                 raise ValueError("Produto não encontrado")
             valor_unitario, tipo_produto, estoque_atual = produto
-            if tipo_produto in ['Card', 'Físico']:
+            if tipo_produto in ['Card', 'Material Físico']:
                 estoque_ajustado = estoque_atual + quantidade_atual - quantidade
                 if estoque_ajustado < 0:
                     raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual}")
@@ -209,7 +215,7 @@ class GestaoVendas:
             produto_id, quantidade = venda
             cursor.execute('SELECT tipo FROM produtos WHERE id = ?', (produto_id,))
             tipo_produto = cursor.fetchone()[0]
-            if tipo_produto in ['Card', 'Físico']:
+            if tipo_produto in ['Card', 'Material Físico']:
                 cursor.execute('''
                     UPDATE produtos 
                     SET quantidade = quantidade + ? 
@@ -251,7 +257,7 @@ class GestaoVendas:
         os.mkdir(backup_dir)
 
         # Backup do banco de dados
-        shutil.copy2('medix_vendas.db', os.path.join(backup_dir, 'medix_vendas.db'))
+        shutil.copy2(self.db_name, os.path.join(backup_dir, self.db_name))
 
         # Backup das tabelas em Excel
         with pd.ExcelWriter(os.path.join(backup_dir, 'tabelas_backup.xlsx')) as writer:
@@ -266,6 +272,46 @@ class GestaoVendas:
 
         return f"{backup_dir}.zip"
 
+    def importar_banco_dados(self, arquivo):
+        try:
+            with zipfile.ZipFile(arquivo, 'r') as zip_ref:
+                zip_ref.extract(self.db_name)
+            self.conn.close()
+            os.remove(self.db_name)
+            os.rename(os.path.join(os.getcwd(), self.db_name), self.db_name)
+            self.conn = sqlite3.connect(self.db_name, check_same_thread=False)
+            return True
+        except Exception as e:
+            st.error(f"Erro ao importar banco de dados: {e}")
+            return False
+
+    def importar_tabelas_excel(self, arquivo):
+        try:
+            with zipfile.ZipFile(arquivo, 'r') as zip_ref:
+                zip_ref.extract('tabelas_backup.xlsx')
+            
+            excel_file = pd.ExcelFile('tabelas_backup.xlsx')
+            
+            produtos_df = pd.read_excel(excel_file, 'Produtos')
+            vendas_df = pd.read_excel(excel_file, 'Vendas')
+            
+            # Limpar tabelas existentes
+            self.conn.execute("DELETE FROM produtos")
+            self.conn.execute("DELETE FROM vendas")
+            
+            # Importar produtos
+            produtos_df.to_sql('produtos', self.conn, if_exists='append', index=False)
+            
+            # Importar vendas
+            vendas_df.to_sql('vendas', self.conn, if_exists='append', index=False)
+            
+            self.conn.commit()
+            os.remove('tabelas_backup.xlsx')
+            return True
+        except Exception as e:
+            st.error(f"Erro ao importar tabelas Excel: {e}")
+            return False
+
 # Funções da interface do usuário
 def cadastrar_produto_ui(gestao):
     st.header("📦 Cadastro de Novo Produto")
@@ -275,7 +321,7 @@ def cadastrar_produto_ui(gestao):
             nome = st.text_input("Nome do Produto")
             valor = st.number_input("Valor", min_value=0.0, step=0.01)
         with col2:
-            tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Físico", "Serviço Digital"])
+            tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Material Físico", "Aula"])
             quantidade = st.number_input("Quantidade (opcional)", min_value=0, step=1)
         link_download = st.text_input("Link de Download (para produtos digitais)")
         descricao = st.text_area("Descrição do Produto")
@@ -284,7 +330,7 @@ def cadastrar_produto_ui(gestao):
             if not nome:
                 st.error("Nome do produto é obrigatório")
             else:
-                sucesso = gestao.cadastrar_produto(nome, tipo, valor, quantidade if tipo in ['Card', 'Físico'] else None, link_download, descricao)
+                sucesso = gestao.cadastrar_produto(nome, tipo, valor, quantidade if tipo in ['Card', 'Material Físico'] else None, link_download, descricao)
                 if sucesso:
                     st.success("Produto cadastrado com sucesso!")
                 else:
@@ -302,20 +348,20 @@ def registrar_venda_ui(gestao):
                 opcoes_produtos = dict(zip(produtos['nome'], produtos['id']))
                 produto_selecionado = st.selectbox("Selecione o Produto", list(opcoes_produtos.keys()))
                 cliente = st.text_input("Nome do Cliente")
-                cpf = st.text_input("CPF do Cliente", help="Digite apenas números")
+                cpf = st.text_input("CPF do Cliente (opcional)", help="Digite apenas números")
                 email = st.text_input("Email do Cliente")
             with col2:
                 produto_info = produtos[produtos['nome'] == produto_selecionado]
                 tipo_produto = produto_info['tipo'].values[0]
                 estoque_max = produto_info['quantidade'].values[0] or 1
-                quantidade = st.number_input("Quantidade", min_value=1, max_value=int(estoque_max) if tipo_produto in ['Card', 'Físico'] else None, step=1)
+                quantidade = st.number_input("Quantidade", min_value=1, max_value=int(estoque_max) if tipo_produto in ['Card', 'Material Físico'] else None, step=1)
                 forma_pagamento = st.selectbox("Forma de Pagamento", ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"])
                 data_compra = st.date_input("Data da Compra", datetime.now())
             submit_venda = st.form_submit_button("Registrar Venda")
             if submit_venda:
                 try:
-                    if not cliente or not cpf:
-                        st.error("Nome do cliente e CPF são obrigatórios")
+                    if not cliente:
+                        st.error("Nome do cliente é obrigatório")
                     else:
                         produto_id = opcoes_produtos[produto_selecionado]
                         gestao.registrar_venda(produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra)
@@ -333,9 +379,9 @@ def listar_produtos_ui(gestao):
                 with col1:
                     st.write(f"**Descrição:** {row['descricao']}")
                     st.write(f"**Valor:** R$ {row['valor']:.2f}")
-                    if row['tipo'] in ['Card', 'Físico']:
+                    if row['tipo'] in ['Card', 'Material Físico']:
                         st.write(f"**Quantidade em estoque:** {row['quantidade']}")
-                    if row['tipo'] in ['PDF', 'Serviço Digital']:
+                    if row['tipo'] in ['PDF', 'Aula']:
                         st.write(f"**Link de download:** {row['link_download']}")
                 with col2:
                     if st.button(f"Editar {row['nome']}", key=f"edit_{row['id']}"):
@@ -352,7 +398,7 @@ def listar_produtos_ui(gestao):
             st.subheader(f"Editando: {produto['nome']}")
             with st.form("editar_produto"):
                 nome = st.text_input("Nome do Produto", value=produto['nome'])
-                tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Físico", "Serviço Digital"], index=["PDF", "Card", "Físico", "Serviço Digital"].index(produto['tipo']))
+                tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Material Físico", "Aula"], index=["PDF", "Card", "Material Físico", "Aula"].index(produto['tipo']))
                 valor = st.number_input("Valor", min_value=0.0, value=float(produto['valor']), step=0.01)
                 quantidade = st.number_input("Quantidade", min_value=0, value=int(produto['quantidade']) if produto['quantidade'] else 0, step=1)
                 link_download = st.text_input("Link de Download", value=produto['link_download'] if produto['link_download'] else "")
@@ -381,7 +427,8 @@ def listar_vendas_ui(gestao):
                     st.write(f"**Valor Total:** R$ {row['valor_total']:.2f}")
                     st.write(f"**Data da Compra:** {row['data_compra']}")
                     st.write(f"**Forma de Pagamento:** {row['forma_pagamento']}")
-                    st.write(f"**CPF:** {row['cpf_cliente']}")
+                    if row['cpf_cliente']:
+                        st.write(f"**CPF:** {row['cpf_cliente']}")
                     st.write(f"**Email:** {row['email_cliente']}")
                 with col2:
                     if st.button(f"Editar Venda {row['id']}", key=f"edit_venda_{row['id']}"):
@@ -401,7 +448,7 @@ def listar_vendas_ui(gestao):
                 opcoes_produtos = dict(zip(produtos['nome'], produtos['id']))
                 produto_selecionado = st.selectbox("Produto", list(opcoes_produtos.keys()), index=list(opcoes_produtos.keys()).index(venda['produto']))
                 cliente = st.text_input("Nome do Cliente", value=venda['cliente'])
-                cpf = st.text_input("CPF do Cliente", value=venda['cpf_cliente'])
+                cpf = st.text_input("CPF do Cliente (opcional)", value=venda['cpf_cliente'] if venda['cpf_cliente'] else "")
                 email = st.text_input("Email do Cliente", value=venda['email_cliente'])
                 quantidade = st.number_input("Quantidade", min_value=1, value=int(venda['quantidade']))
                 forma_pagamento = st.selectbox("Forma de Pagamento", ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"], index=["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"].index(venda['forma_pagamento']))
@@ -418,20 +465,42 @@ def listar_vendas_ui(gestao):
         st.warning("Nenhuma venda registrada")
 
 def backup_ui(gestao):
-    st.header("💾 Realizar Backup")
-    if st.button("Iniciar Backup"):
-        try:
-            backup_file = gestao.realizar_backup()
-            st.success("Backup realizado com sucesso!")
-            with open(backup_file, "rb") as file:
-                st.download_button(
-                    label="Baixar Arquivo de Backup",
-                    data=file,
-                    file_name=backup_file,
-                    mime="application/zip"
-                )
-        except Exception as e:
-            st.error(f"Erro ao realizar backup: {e}")
+    st.header("💾 Backup e Restauração")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Realizar Backup")
+        if st.button("Iniciar Backup"):
+            try:
+                backup_file = gestao.realizar_backup()
+                st.success("Backup realizado com sucesso!")
+                with open(backup_file, "rb") as file:
+                    st.download_button(
+                        label="Baixar Arquivo de Backup",
+                        data=file,
+                        file_name=backup_file,
+                        mime="application/zip"
+                    )
+            except Exception as e:
+                st.error(f"Erro ao realizar backup: {e}")
+    
+    with col2:
+        st.subheader("Importar Backup")
+        uploaded_file = st.file_uploader("Escolha o arquivo de backup", type="zip")
+        if uploaded_file is not None:
+            import_option = st.radio("Escolha o que importar:", ["Banco de Dados", "Tabelas Excel", "Ambos"])
+            if st.button("Importar"):
+                try:
+                    if import_option in ["Banco de Dados", "Ambos"]:
+                        if gestao.importar_banco_dados(uploaded_file):
+                            st.success("Banco de dados importado com sucesso!")
+                    if import_option in ["Tabelas Excel", "Ambos"]:
+                        if gestao.importar_tabelas_excel(uploaded_file):
+                            st.success("Tabelas Excel importadas com sucesso!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao importar backup: {e}")
 
 def visualizar_planilha_ui(gestao):
     st.header("👀 Visualizar Planilha")
@@ -505,7 +574,7 @@ def main():
             "💳 Registrar Venda", 
             "📋 Listar Produtos", 
             "📊 Listar Vendas",
-            "💾 Realizar Backup",
+            "💾 Backup e Restauração",
             "👀 Visualizar Planilha"
         ])
 
@@ -524,7 +593,7 @@ def main():
         listar_produtos_ui(gestao)
     elif menu == "📊 Listar Vendas":
         listar_vendas_ui(gestao)
-    elif menu == "💾 Realizar Backup":
+    elif menu == "💾 Backup e Restauração":
         backup_ui(gestao)
     elif menu == "👀 Visualizar Planilha":
         visualizar_planilha_ui(gestao)
