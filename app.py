@@ -11,7 +11,7 @@ import io
 
 # Configuração Inicial do Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = "google_sheets_credentials.json"  # Coloque no Streamlit Secrets
+SERVICE_ACCOUNT_FILE = "google_sheets_credentials.json"  # Arquivo de credenciais JSON
 SPREADSHEET_NAME = "MEDIX_Gestao_Vendas"
 
 # Credenciais do Google
@@ -87,7 +87,11 @@ def main():
     """, unsafe_allow_html=True)
 
     # Cabeçalho Principal
-    st.title("MEDIX - Gestão de Produtos e Vendas")
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        st.image("logo_medix.jpeg", width=150)
+    with col2:
+        st.title("MEDIX - Gestão de Produtos e Vendas")
 
     gestao = GestaoVendas()
 
