@@ -8,6 +8,11 @@ import openpyxl
 import os
 import shutil
 import zipfile
+import logging
+
+# Configuração de logging
+logging.basicConfig(filename='app.log', level=logging.DEBUG, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Funções auxiliares
 def validar_cpf(cpf):
@@ -52,6 +57,7 @@ class GestaoVendas:
                     pass
             self.conn.commit()
         except Exception as e:
+            logging.error(f"Erro ao migrar banco de dados: {e}")
             st.error(f"Erro ao migrar banco de dados: {e}")
 
     def criar_tabelas(self):
@@ -105,6 +111,7 @@ class GestaoVendas:
             self.conn.commit()
             return True
         except Exception as e:
+            logging.error(f"Erro ao cadastrar produto: {e}")
             st.error(f"Erro ao cadastrar produto: {e}")
             return False
 
@@ -121,6 +128,7 @@ class GestaoVendas:
             self.conn.commit()
             return True
         except Exception as e:
+            logging.error(f"Erro ao editar produto: {e}")
             st.error(f"Erro ao editar produto: {e}")
             return False
 
@@ -131,40 +139,57 @@ class GestaoVendas:
             self.conn.commit()
             return True
         except Exception as e:
+            logging.error(f"Erro ao remover produto: {e}")
             st.error(f"Erro ao remover produto: {e}")
             return False
 
     def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
         cursor = self.conn.cursor()
-        if cpf and not validar_cpf(cpf):
-            raise ValueError("CPF inválido")
-        cpf_formatado = formatar_cpf(cpf) if cpf else None
-        cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
-        produto = cursor.fetchone()
-        if not produto:
-            raise ValueError("Produto não encontrado")
-        valor_unitario, tipo_produto, estoque_atual = produto
-        if tipo_produto in ['Card', 'Material Físico'] and (estoque_atual is None or quantidade > estoque_atual):
-            raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual or 0}")
-        valor_total = valor_unitario * quantidade
-        data_registro = datetime.now()
-        if not data_compra:
-            data_compra = data_registro.date()
-        cursor.execute('''
-            INSERT INTO vendas (
-                produto_id, cliente, cpf_cliente, email_cliente, quantidade, 
-                valor_total, forma_pagamento, data_registro, data_compra
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (produto_id, cliente, cpf_formatado, email, quantidade, 
-              valor_total, forma_pagamento, data_registro, data_compra))
-        if tipo_produto in ['Card', 'Material Físico']:
+        try:
+            logging.debug(f"Iniciando registro de venda: produto_id={produto_id}, cliente={cliente}, quantidade={quantidade}")
+            if cpf and not validar_cpf(cpf):
+                raise ValueError("CPF inválido")
+            cpf_formatado = formatar_cpf(cpf) if cpf else None
+            cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
+            produto = cursor.fetchone()
+            if not produto:
+                raise ValueError("Produto não encontrado")
+            valor_unitario, tipo_produto, estoque_atual = produto
+            if tipo_produto in ['Card', 'Material Físico']:
+                if estoque_atual is None:
+                    raise ValueError("Estoque não definido para este produto")
+                if quantidade > estoque_atual:
+                    raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual}")
+            valor_total = valor_unitario * quantidade
+            data_registro = datetime.now()
+            if not data_compra:
+                data_compra = data_registro.date()
             cursor.execute('''
-                UPDATE produtos 
-                SET quantidade = quantidade - ? 
-                WHERE id = ?
-            ''', (quantidade, produto_id))
-        self.conn.commit()
-        return True
+                INSERT INTO vendas (
+                    produto_id, cliente, cpf_cliente, email_cliente, quantidade, 
+                    valor_total, forma_pagamento, data_registro, data_compra
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (produto_id, cliente, cpf_formatado, email, quantidade, 
+                  valor_total, forma_pagamento, data_registro, data_compra))
+            if tipo_produto in ['Card', 'Material Físico']:
+                cursor.execute('''
+                    UPDATE produtos 
+                    SET quantidade = quantidade - ? 
+                    WHERE id = ?
+                ''', (quantidade, produto_id))
+            self.conn.commit()
+            logging.debug("Venda registrada com sucesso")
+            return True
+        except sqlite3.Error as e:
+            logging.error(f"Erro no banco de dados: {str(e)}")
+            self.conn.rollback()
+            raise ValueError(f"Erro no banco de dados: {str(e)}")
+        except Exception as e:
+            logging.error(f"Erro ao registrar venda: {str(e)}")
+            self.conn.rollback()
+            raise ValueError(f"Erro ao registrar venda: {str(e)}")
+        finally:
+            cursor.close()
 
     def editar_venda(self, id, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
         cursor = self.conn.cursor()
@@ -202,6 +227,7 @@ class GestaoVendas:
             self.conn.commit()
             return True
         except Exception as e:
+            logging.error(f"Erro ao editar venda: {e}")
             st.error(f"Erro ao editar venda: {e}")
             return False
 
@@ -225,6 +251,7 @@ class GestaoVendas:
             self.conn.commit()
             return True
         except Exception as e:
+            logging.error(f"Erro ao remover venda: {e}")
             st.error(f"Erro ao remover venda: {e}")
             return False
 
@@ -324,10 +351,15 @@ def registrar_venda_ui(gestao):
                         st.error("Nome do cliente é obrigatório")
                     else:
                         produto_id = opcoes_produtos[produto_selecionado]
-                        gestao.registrar_venda(produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra)
-                        st.success("Venda registrada com sucesso!")
+                        if gestao.registrar_venda(produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
+                            st.success("Venda registrada com sucesso!")
+                        else:
+                            st.error("Falha ao registrar a venda")
                 except ValueError as e:
                     st.error(str(e))
+                except Exception as e:
+                    st.error(f"Erro inesperado: {str(e)}")
+                    logging.error(f"Erro inesperado ao registrar venda: {str(e)}")
 
 def listar_produtos_ui(gestao):
     st.header("📋 Lista de Produtos")
@@ -360,9 +392,9 @@ def listar_produtos_ui(gestao):
                 nome = st.text_input("Nome do Produto", value=produto['nome'])
                 tipo = st.selectbox("Tipo de Produto", ["PDF", "Card", "Material Físico", "Aula"], index=["PDF", "Card", "Material Físico", "Aula"].index(produto['tipo']))
                 valor = st.number_input("Valor", min_value=0.0, value=float(produto['valor']), step=0.01)
-                quantidade = st.number_input("Quantidade", min_value=0, value=int(produto['quantidade']) if produto['quantidade'] else 0, step=1)
-                link_download = st.text_input("Link de Download", value=produto['link_download'] if produto['link_download'] else "")
-                descricao = st.text_area("Descrição", value=produto['descricao'] if produto['descricao'] else "")
+                quantidade = st.number_input("Quantidade", min_value=0, value=int(produto['quantidade']) if pd.notnull(produto['quantidade']) else 0, step=1)
+                link_download = st.text_input("Link de Download", value=produto['link_download'] if pd.notnull(produto['link_download']) else "")
+                descricao = st.text_area("Descrição", value=produto['descricao'] if pd.notnull(produto['descricao']) else "")
                 submit_edit = st.form_submit_button("Atualizar Produto")
                 if submit_edit:
                     if gestao.editar_produto(st.session_state.editing_product, nome, tipo, valor, quantidade, link_download, descricao):
@@ -412,7 +444,7 @@ def listar_vendas_ui(gestao):
                 email = st.text_input("Email do Cliente", value=venda['email_cliente'])
                 quantidade = st.number_input("Quantidade", min_value=1, value=int(venda['quantidade']))
                 forma_pagamento = st.selectbox("Forma de Pagamento", ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"], index=["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"].index(venda['forma_pagamento']))
-                data_compra = st.date_input("Data da Compra", value=datetime.strptime(venda['data_compra'], '%Y-%m-%d').date() if venda['data_compra'] else datetime.now())
+                data_compra = st.date_input("Data da Compra", value=pd.to_datetime(venda['data_compra']).date() if pd.notnull(venda['data_compra']) else datetime.now())
                 submit_edit = st.form_submit_button("Atualizar Venda")
                 if submit_edit:
                     if gestao.editar_venda(st.session_state.editing_sale, opcoes_produtos[produto_selecionado], cliente, cpf, email, quantidade, forma_pagamento, data_compra):
@@ -443,6 +475,7 @@ def backup_ui(gestao):
                         mime="application/zip"
                     )
             except Exception as e:
+                logging.error(f"Erro ao realizar backup: {e}")
                 st.error(f"Erro ao realizar backup: {e}")
     
     with col2:
@@ -463,6 +496,7 @@ def backup_ui(gestao):
                         st.success("Banco de dados importado com sucesso!")
                         st.rerun()
                     except Exception as e:
+                        logging.error(f"Erro ao importar banco de dados: {e}")
                         st.error(f"Erro ao importar banco de dados: {e}")
         
         else:  # Tabelas Excel
@@ -488,6 +522,7 @@ def backup_ui(gestao):
                         st.success("Tabelas Excel importadas com sucesso!")
                         st.rerun()
                     except Exception as e:
+                        logging.error(f"Erro ao importar tabelas Excel: {e}")
                         st.error(f"Erro ao importar tabelas Excel: {e}")
 
 def visualizar_planilha_ui(gestao):
