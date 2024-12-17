@@ -42,9 +42,23 @@ def formatar_cpf(cpf):
 class GestaoVendas:
     def __init__(self, db_name='medix_vendas.db'):
         self.db_name = db_name
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.migrar_banco_dados()
-        self.criar_tabelas()
+        self.conn = None
+        self.conectar_bd()
+
+    def conectar_bd(self):
+        try:
+            self.conn = sqlite3.connect(self.db_name, check_same_thread=False)
+            self.conn.execute('PRAGMA foreign_keys = ON;')
+            self.migrar_banco_dados()
+            self.criar_tabelas()
+        except sqlite3.Error as e:
+            logging.error(f"Erro ao conectar ao banco de dados: {e}")
+            st.error(f"Erro ao conectar ao banco de dados: {e}")
+
+    def reconectar_bd(self):
+        if self.conn:
+            self.conn.close()
+        self.conectar_bd()
 
     def migrar_banco_dados(self):
         cursor = self.conn.cursor()
@@ -100,26 +114,29 @@ class GestaoVendas:
         return cursor.fetchone()[0] == 0
 
     def cadastrar_produto(self, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
-        cursor = self.conn.cursor()
         try:
             if not self.validar_produto(nome):
                 raise ValueError("Já existe um produto com este nome")
+            cursor = self.conn.cursor()
             cursor.execute('''
                 INSERT INTO produtos (nome, tipo, valor, quantidade, link_download, descricao) 
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (nome, tipo, valor, quantidade, link_download, descricao))
             self.conn.commit()
             return True
+        except sqlite3.Error as e:
+            logging.error(f"Erro ao cadastrar produto: {e}")
+            self.reconectar_bd()
+            return False
         except Exception as e:
             logging.error(f"Erro ao cadastrar produto: {e}")
-            st.error(f"Erro ao cadastrar produto: {e}")
             return False
 
     def editar_produto(self, id, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
-        cursor = self.conn.cursor()
         try:
             if not self.validar_produto(nome, id):
                 raise ValueError("Já existe outro produto com este nome")
+            cursor = self.conn.cursor()
             cursor.execute('''
                 UPDATE produtos 
                 SET nome=?, tipo=?, valor=?, quantidade=?, link_download=?, descricao=?
@@ -127,29 +144,35 @@ class GestaoVendas:
             ''', (nome, tipo, valor, quantidade, link_download, descricao, id))
             self.conn.commit()
             return True
+        except sqlite3.Error as e:
+            logging.error(f"Erro ao editar produto: {e}")
+            self.reconectar_bd()
+            return False
         except Exception as e:
             logging.error(f"Erro ao editar produto: {e}")
-            st.error(f"Erro ao editar produto: {e}")
             return False
 
     def remover_produto(self, id):
-        cursor = self.conn.cursor()
         try:
+            cursor = self.conn.cursor()
             cursor.execute('DELETE FROM produtos WHERE id = ?', (id,))
             self.conn.commit()
             return True
+        except sqlite3.Error as e:
+            logging.error(f"Erro ao remover produto: {e}")
+            self.reconectar_bd()
+            return False
         except Exception as e:
             logging.error(f"Erro ao remover produto: {e}")
-            st.error(f"Erro ao remover produto: {e}")
             return False
 
     def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
-        cursor = self.conn.cursor()
         try:
             logging.debug(f"Iniciando registro de venda: produto_id={produto_id}, cliente={cliente}, quantidade={quantidade}")
             if cpf and not validar_cpf(cpf):
                 raise ValueError("CPF inválido")
             cpf_formatado = formatar_cpf(cpf) if cpf else None
+            cursor = self.conn.cursor()
             cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
             produto = cursor.fetchone()
             if not produto:
@@ -183,20 +206,19 @@ class GestaoVendas:
         except sqlite3.Error as e:
             logging.error(f"Erro no banco de dados: {str(e)}")
             self.conn.rollback()
+            self.reconectar_bd()
             raise ValueError(f"Erro no banco de dados: {str(e)}")
         except Exception as e:
             logging.error(f"Erro ao registrar venda: {str(e)}")
             self.conn.rollback()
             raise ValueError(f"Erro ao registrar venda: {str(e)}")
-        finally:
-            cursor.close()
 
     def editar_venda(self, id, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
-        cursor = self.conn.cursor()
         try:
             if cpf and not validar_cpf(cpf):
                 raise ValueError("CPF inválido")
             cpf_formatado = formatar_cpf(cpf) if cpf else None
+            cursor = self.conn.cursor()
             cursor.execute('SELECT produto_id, quantidade FROM vendas WHERE id = ?', (id,))
             venda_atual = cursor.fetchone()
             if not venda_atual:
@@ -226,14 +248,19 @@ class GestaoVendas:
                   valor_total, forma_pagamento, data_compra, id))
             self.conn.commit()
             return True
+        except sqlite3.Error as e:
+            logging.error(f"Erro ao editar venda: {e}")
+            self.conn.rollback()
+            self.reconectar_bd()
+            return False
         except Exception as e:
             logging.error(f"Erro ao editar venda: {e}")
-            st.error(f"Erro ao editar venda: {e}")
+            self.conn.rollback()
             return False
 
     def remover_venda(self, id):
-        cursor = self.conn.cursor()
         try:
+            cursor = self.conn.cursor()
             cursor.execute('SELECT produto_id, quantidade FROM vendas WHERE id = ?', (id,))
             venda = cursor.fetchone()
             if not venda:
@@ -250,9 +277,14 @@ class GestaoVendas:
             cursor.execute('DELETE FROM vendas WHERE id = ?', (id,))
             self.conn.commit()
             return True
+        except sqlite3.Error as e:
+            logging.error(f"Erro ao remover venda: {e}")
+            self.conn.rollback()
+            self.reconectar_bd()
+            return False
         except Exception as e:
             logging.error(f"Erro ao remover venda: {e}")
-            st.error(f"Erro ao remover venda: {e}")
+            self.conn.rollback()
             return False
 
     def listar_produtos(self):
@@ -492,7 +524,7 @@ def backup_ui(gestao):
                         gestao.conn.close()
                         os.remove(gestao.db_name)
                         os.rename("temp_medix_vendas.db", gestao.db_name)
-                        gestao.conn = sqlite3.connect(gestao.db_name, check_same_thread=False)
+                        gestao.conectar_bd()
                         st.success("Banco de dados importado com sucesso!")
                         st.rerun()
                     except Exception as e:
@@ -605,7 +637,9 @@ def main():
 
     if 'gestao' not in st.session_state:
         st.session_state.gestao = GestaoVendas()
-    
+    else:
+        st.session_state.gestao.reconectar_bd()
+
     gestao = st.session_state.gestao
 
     if menu == "📦 Cadastrar Produto":
