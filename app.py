@@ -272,46 +272,6 @@ class GestaoVendas:
 
         return f"{backup_dir}.zip"
 
-    def importar_banco_dados(self, arquivo):
-        try:
-            with zipfile.ZipFile(arquivo, 'r') as zip_ref:
-                zip_ref.extract(self.db_name)
-            self.conn.close()
-            os.remove(self.db_name)
-            os.rename(os.path.join(os.getcwd(), self.db_name), self.db_name)
-            self.conn = sqlite3.connect(self.db_name, check_same_thread=False)
-            return True
-        except Exception as e:
-            st.error(f"Erro ao importar banco de dados: {e}")
-            return False
-
-    def importar_tabelas_excel(self, arquivo):
-        try:
-            with zipfile.ZipFile(arquivo, 'r') as zip_ref:
-                zip_ref.extract('tabelas_backup.xlsx')
-            
-            excel_file = pd.ExcelFile('tabelas_backup.xlsx')
-            
-            produtos_df = pd.read_excel(excel_file, 'Produtos')
-            vendas_df = pd.read_excel(excel_file, 'Vendas')
-            
-            # Limpar tabelas existentes
-            self.conn.execute("DELETE FROM produtos")
-            self.conn.execute("DELETE FROM vendas")
-            
-            # Importar produtos
-            produtos_df.to_sql('produtos', self.conn, if_exists='append', index=False)
-            
-            # Importar vendas
-            vendas_df.to_sql('vendas', self.conn, if_exists='append', index=False)
-            
-            self.conn.commit()
-            os.remove('tabelas_backup.xlsx')
-            return True
-        except Exception as e:
-            st.error(f"Erro ao importar tabelas Excel: {e}")
-            return False
-
 # Funções da interface do usuário
 def cadastrar_produto_ui(gestao):
     st.header("📦 Cadastro de Novo Produto")
@@ -487,20 +447,48 @@ def backup_ui(gestao):
     
     with col2:
         st.subheader("Importar Backup")
-        uploaded_file = st.file_uploader("Escolha o arquivo de backup", type="zip")
-        if uploaded_file is not None:
-            import_option = st.radio("Escolha o que importar:", ["Banco de Dados", "Tabelas Excel", "Ambos"])
-            if st.button("Importar"):
-                try:
-                    if import_option in ["Banco de Dados", "Ambos"]:
-                        if gestao.importar_banco_dados(uploaded_file):
-                            st.success("Banco de dados importado com sucesso!")
-                    if import_option in ["Tabelas Excel", "Ambos"]:
-                        if gestao.importar_tabelas_excel(uploaded_file):
-                            st.success("Tabelas Excel importadas com sucesso!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao importar backup: {e}")
+        import_option = st.radio("Escolha o que importar:", ["Banco de Dados (medix_vendas.db)", "Tabelas Excel (tabelas_backup.xlsx)"])
+        
+        if import_option == "Banco de Dados (medix_vendas.db)":
+            uploaded_file = st.file_uploader("Escolha o arquivo de banco de dados", type="db")
+            if uploaded_file is not None:
+                if st.button("Importar Banco de Dados"):
+                    try:
+                        with open("temp_medix_vendas.db", "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        gestao.conn.close()
+                        os.remove(gestao.db_name)
+                        os.rename("temp_medix_vendas.db", gestao.db_name)
+                        gestao.conn = sqlite3.connect(gestao.db_name, check_same_thread=False)
+                        st.success("Banco de dados importado com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao importar banco de dados: {e}")
+        
+        else:  # Tabelas Excel
+            uploaded_file = st.file_uploader("Escolha o arquivo de tabelas Excel", type="xlsx")
+            if uploaded_file is not None:
+                if st.button("Importar Tabelas Excel"):
+                    try:
+                        excel_file = pd.ExcelFile(uploaded_file)
+                        produtos_df = pd.read_excel(excel_file, 'Produtos')
+                        vendas_df = pd.read_excel(excel_file, 'Vendas')
+                        
+                        # Limpar tabelas existentes
+                        gestao.conn.execute("DELETE FROM produtos")
+                        gestao.conn.execute("DELETE FROM vendas")
+                        
+                        # Importar produtos
+                        produtos_df.to_sql('produtos', gestao.conn, if_exists='append', index=False)
+                        
+                        # Importar vendas
+                        vendas_df.to_sql('vendas', gestao.conn, if_exists='append', index=False)
+                        
+                        gestao.conn.commit()
+                        st.success("Tabelas Excel importadas com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao importar tabelas Excel: {e}")
 
 def visualizar_planilha_ui(gestao):
     st.header("👀 Visualizar Planilha")
