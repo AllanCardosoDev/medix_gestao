@@ -5,20 +5,43 @@ import re
 import io
 import openpyxl
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from google.oauth2 import service_account
 import gspread
-from gspread_dataframe import set_with_dataframe
+from gspread_dataframe import set_with_dataframe, get_as_dataframe
 
 # Configuração das credenciais do Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = 'path/to/your/service_account_file.json'  # Você precisa criar este arquivo
-
-creds = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+CLIENT_ID = '1072458931980-mpf2loc5b26l3j5ke1hf0fhghnrfv6i1.apps.googleusercontent.com'
+CLIENT_SECRET = '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'
 
 # Nome da planilha
 SPREADSHEET_NAME = "MEDIX_Gestao_Vendas"
+
+def get_credentials():
+    creds = None
+    if 'token' in st.session_state:
+        creds = Credentials.from_authorized_user_info(st.session_state['token'], SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_config(
+                {
+                    "installed": {
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                        "token_uri": "https://oauth2.googleapis.com/token",
+                    }
+                },
+                SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+        st.session_state['token'] = creds.to_json()
+    return creds
 
 def validar_cpf(cpf):
     if not cpf or cpf == '00000000000':
@@ -46,6 +69,7 @@ def formatar_cpf(cpf):
 
 class GestaoVendas:
     def __init__(self):
+        creds = get_credentials()
         self.client = gspread.authorize(creds)
         self.sheet = self.get_or_create_spreadsheet()
         self.produtos_sheet = self.get_or_create_worksheet("Produtos")
@@ -65,14 +89,22 @@ class GestaoVendas:
 
     def cadastrar_produto(self, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
         try:
-            produtos = self.produtos_sheet.get_all_records()
-            if any(p['nome'] == nome for p in produtos):
+            produtos = self.listar_produtos()
+            if not produtos.empty and produtos['nome'].str.lower().eq(nome.lower()).any():
                 raise ValueError("Já existe um produto com este nome")
 
-            novo_id = len(produtos) + 1
-            self.produtos_sheet.append_row([
-                novo_id, nome, tipo, valor, quantidade, link_download, descricao
-            ])
+            novo_id = 1 if produtos.empty else produtos['id'].max() + 1
+            novo_produto = pd.DataFrame({
+                'id': [novo_id],
+                'nome': [nome],
+                'tipo': [tipo],
+                'valor': [valor],
+                'quantidade': [quantidade],
+                'link_download': [link_download],
+                'descricao': [descricao]
+            })
+            produtos = pd.concat([produtos, novo_produto], ignore_index=True)
+            set_with_dataframe(self.produtos_sheet, produtos)
             return True
         except Exception as e:
             st.error(f"Erro ao cadastrar produto: {e}")
@@ -80,14 +112,14 @@ class GestaoVendas:
 
     def editar_produto(self, id, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
         try:
-            produtos = self.produtos_sheet.get_all_records()
-            if any(p['nome'] == nome and p['id'] != id for p in produtos):
+            produtos = self.listar_produtos()
+            if produtos[produtos['id'] != id]['nome'].str.lower().eq(nome.lower()).any():
                 raise ValueError("Já existe outro produto com este nome")
 
-            row = self.produtos_sheet.find(str(id)).row
-            self.produtos_sheet.update(f'A{row}:G{row}', [[
-                id, nome, tipo, valor, quantidade, link_download, descricao
-            ]])
+            produtos.loc[produtos['id'] == id, ['nome', 'tipo', 'valor', 'quantidade', 'link_download', 'descricao']] = [
+                nome, tipo, valor, quantidade, link_download, descricao
+            ]
+            set_with_dataframe(self.produtos_sheet, produtos)
             return True
         except Exception as e:
             st.error(f"Erro ao editar produto: {e}")
@@ -95,8 +127,9 @@ class GestaoVendas:
 
     def remover_produto(self, id):
         try:
-            row = self.produtos_sheet.find(str(id)).row
-            self.produtos_sheet.delete_rows(row)
+            produtos = self.listar_produtos()
+            produtos = produtos[produtos['id'] != id]
+            set_with_dataframe(self.produtos_sheet, produtos)
             return True
         except Exception as e:
             st.error(f"Erro ao remover produto: {e}")
@@ -109,10 +142,10 @@ class GestaoVendas:
             
             cpf_formatado = formatar_cpf(cpf) if cpf else None
             
-            produtos = self.produtos_sheet.get_all_records()
-            produto = next((p for p in produtos if p['id'] == produto_id), None)
+            produtos = self.listar_produtos()
+            produto = produtos[produtos['id'] == produto_id].iloc[0]
             
-            if not produto:
+            if produto.empty:
                 raise ValueError("Produto não encontrado")
             
             valor_unitario = produto['valor']
@@ -128,18 +161,29 @@ class GestaoVendas:
             if not data_compra:
                 data_compra = datetime.now().date().strftime("%Y-%m-%d")
 
-            vendas = self.vendas_sheet.get_all_records()
-            novo_id = len(vendas) + 1
+            vendas = self.listar_vendas()
+            novo_id = 1 if vendas.empty else vendas['id'].max() + 1
             
-            self.vendas_sheet.append_row([
-                novo_id, produto_id, cliente, cpf_formatado, email, quantidade,
-                valor_total, forma_pagamento, data_registro, data_compra, "Processando"
-            ])
+            nova_venda = pd.DataFrame({
+                'id': [novo_id],
+                'produto_id': [produto_id],
+                'cliente': [cliente],
+                'cpf_cliente': [cpf_formatado],
+                'email_cliente': [email],
+                'quantidade': [quantidade],
+                'valor_total': [valor_total],
+                'forma_pagamento': [forma_pagamento],
+                'data_registro': [data_registro],
+                'data_compra': [data_compra],
+                'status': ["Processando"]
+            })
+            
+            vendas = pd.concat([vendas, nova_venda], ignore_index=True)
+            set_with_dataframe(self.vendas_sheet, vendas)
             
             if tipo_produto in ['Card', 'Físico']:
-                row = self.produtos_sheet.find(str(produto_id)).row
-                novo_estoque = estoque_atual - quantidade
-                self.produtos_sheet.update_cell(row, 5, novo_estoque)
+                produtos.loc[produtos['id'] == produto_id, 'quantidade'] -= quantidade
+                set_with_dataframe(self.produtos_sheet, produtos)
             
             return True
         except Exception as e:
@@ -153,14 +197,14 @@ class GestaoVendas:
             
             cpf_formatado = formatar_cpf(cpf) if cpf else None
             
-            vendas = self.vendas_sheet.get_all_records()
-            venda_atual = next((v for v in vendas if v['id'] == id), None)
-            if not venda_atual:
+            vendas = self.listar_vendas()
+            venda_atual = vendas[vendas['id'] == id].iloc[0]
+            if venda_atual.empty:
                 raise ValueError("Venda não encontrada")
             
-            produtos = self.produtos_sheet.get_all_records()
-            produto = next((p for p in produtos if p['id'] == produto_id), None)
-            if not produto:
+            produtos = self.listar_produtos()
+            produto = produtos[produtos['id'] == produto_id].iloc[0]
+            if produto.empty:
                 raise ValueError("Produto não encontrado")
             
             valor_unitario = produto['valor']
@@ -172,16 +216,20 @@ class GestaoVendas:
                 if estoque_ajustado < 0:
                     raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual}")
                 
-                row = self.produtos_sheet.find(str(produto_id)).row
-                self.produtos_sheet.update_cell(row, 5, estoque_ajustado)
+                produtos.loc[produtos['id'] == produto_id, 'quantidade'] = estoque_ajustado
+                set_with_dataframe(self.produtos_sheet, produtos)
             
             valor_total = valor_unitario * quantidade
             
-            row = self.vendas_sheet.find(str(id)).row
-            self.vendas_sheet.update(f'A{row}:K{row}', [[
-                id, produto_id, cliente, cpf_formatado, email, quantidade,
-                valor_total, forma_pagamento, venda_atual['data_registro'], data_compra, venda_atual['status']
-            ]])
+            vendas.loc[vendas['id'] == id, [
+                'produto_id', 'cliente', 'cpf_cliente', 'email_cliente', 'quantidade',
+                'valor_total', 'forma_pagamento', 'data_compra'
+            ]] = [
+                produto_id, cliente, cpf_formatado, email, quantidade,
+                valor_total, forma_pagamento, data_compra
+            ]
+            
+            set_with_dataframe(self.vendas_sheet, vendas)
             
             return True
         except Exception as e:
@@ -190,32 +238,31 @@ class GestaoVendas:
 
     def remover_venda(self, id):
         try:
-            vendas = self.vendas_sheet.get_all_records()
-            venda = next((v for v in vendas if v['id'] == id), None)
-            if not venda:
+            vendas = self.listar_vendas()
+            venda = vendas[vendas['id'] == id].iloc[0]
+            if venda.empty:
                 raise ValueError("Venda não encontrada")
             
-            produtos = self.produtos_sheet.get_all_records()
-            produto = next((p for p in produtos if p['id'] == venda['produto_id']), None)
+            produtos = self.listar_produtos()
+            produto = produtos[produtos['id'] == venda['produto_id']].iloc[0]
             
             if produto['tipo'] in ['Card', 'Físico']:
-                row = self.produtos_sheet.find(str(venda['produto_id'])).row
-                novo_estoque = produto['quantidade'] + venda['quantidade']
-                self.produtos_sheet.update_cell(row, 5, novo_estoque)
+                produtos.loc[produtos['id'] == venda['produto_id'], 'quantidade'] += venda['quantidade']
+                set_with_dataframe(self.produtos_sheet, produtos)
             
-            row = self.vendas_sheet.find(str(id)).row
-            self.vendas_sheet.delete_rows(row)
+            vendas = vendas[vendas['id'] != id]
+            set_with_dataframe(self.vendas_sheet, vendas)
             return True
         except Exception as e:
             st.error(f"Erro ao remover venda: {e}")
             return False
 
     def listar_produtos(self):
-        return pd.DataFrame(self.produtos_sheet.get_all_records())
+        return get_as_dataframe(self.produtos_sheet)
 
     def listar_vendas(self):
-        vendas = pd.DataFrame(self.vendas_sheet.get_all_records())
-        produtos = pd.DataFrame(self.produtos_sheet.get_all_records())
+        vendas = get_as_dataframe(self.vendas_sheet)
+        produtos = get_as_dataframe(self.produtos_sheet)
         return vendas.merge(produtos[['id', 'nome', 'tipo']], left_on='produto_id', right_on='id', suffixes=('', '_produto'))
 
     def exportar_excel(self, tipo='vendas'):
@@ -292,14 +339,14 @@ def registrar_venda_ui(gestao):
                 email = st.text_input("Email do Cliente")
             
             with col2:
-                produto_info = produtos[produtos['nome'] == produto_selecionado]
-                tipo_produto = produto_info['tipo'].values[0]
-                estoque_max = produto_info['quantidade'].values[0] or 1
+                produto_info = produtos[produtos['nome'] == produto_selecionado].iloc[0]
+                tipo_produto = produto_info['tipo']
+                estoque_max = produto_info['quantidade'] or 1
                 
                 quantidade = st.number_input(
                     "Quantidade", 
                     min_value=1, 
-                    max_value=int(estoque_max) if tipo_produto in ['Card', 'Físico'] else 1, 
+                    max_value=int(estoque_max) if tipo_produto in ['Card', 'Físico'] else None, 
                     step=1
                 )
                 
@@ -321,7 +368,7 @@ def registrar_venda_ui(gestao):
                         st.stop()
                     
                     produto_id = opcoes_produtos[produto_selecionado]
-                    gestao.registrar_venda(
+                    sucesso = gestao.registrar_venda(
                         produto_id, 
                         cliente, 
                         cpf,
@@ -330,7 +377,10 @@ def registrar_venda_ui(gestao):
                         forma_pagamento,
                         data_compra
                     )
-                    st.success("Venda registrada com sucesso!")
+                    if sucesso:
+                        st.success("Venda registrada com sucesso!")
+                    else:
+                        st.error("Erro ao registrar venda")
                 except ValueError as e:
                     st.error(str(e))
 
@@ -423,7 +473,7 @@ def listar_vendas_ui(gestao):
                 email = st.text_input("Email do Cliente", value=venda['email_cliente'] if venda['email_cliente'] else "")
                 quantidade = st.number_input("Quantidade", min_value=1, value=int(venda['quantidade']))
                 forma_pagamento = st.selectbox("Forma de Pagamento", ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"], index=["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária"].index(venda['forma_pagamento']))
-                data_compra = st.date_input("Data da Compra", value=datetime.strptime(venda['data_compra'], '%Y-%m-%d').date() if venda['data_compra'] else datetime.now())
+                data_compra = st.date_input("Data da Compra", value=pd.to_datetime(venda['data_compra']).date() if venda['data_compra'] else datetime.now())
                 
                 submit_edit = st.form_submit_button("Atualizar Venda")
                 
