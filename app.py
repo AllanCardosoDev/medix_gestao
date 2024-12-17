@@ -1,312 +1,208 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 from datetime import datetime
 import re
 import io
 import openpyxl
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+import gspread
+
+# Configuração das credenciais do Google Sheets
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+SERVICE_ACCOUNT_FILE = 'path/to/your/service_account_file.json'  # Você precisa criar este arquivo
+
+creds = service_account.Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+
+# ID da sua planilha do Google Sheets
+SPREADSHEET_ID = 'your_spreadsheet_id_here'
 
 def validar_cpf(cpf):
-    """Validação básica de CPF"""
     if not cpf or cpf == '00000000000':
-        return True  # CPF vazio ou com zeros é considerado válido
-    
+        return True
     cpf = re.sub(r'\D', '', cpf)
-    
     if len(cpf) != 11:
         return False
-    
     if len(set(cpf)) == 1:
         return False
-    
     def calcular_digito_verificador(cpf, peso):
         soma = sum(int(d) * p for d, p in zip(cpf, peso))
         resto = soma % 11
         return 0 if resto < 2 else 11 - resto
-    
     peso1 = list(range(10, 1, -1))
     peso2 = list(range(11, 1, -1))
-    
     digito1 = calcular_digito_verificador(cpf[:9], peso1)
     digito2 = calcular_digito_verificador(cpf[:9] + str(digito1), peso2)
-    
     return cpf[-2:] == f"{digito1}{digito2}"
 
 def formatar_cpf(cpf):
-    """Formata o CPF com pontos e traço"""
     if not cpf or cpf == '00000000000':
         return cpf
     cpf = re.sub(r'\D', '', cpf)
     return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
 
 class GestaoVendas:
-    def __init__(self, db_name='medix_vendas.db'):
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
-        self.migrar_banco_dados()
-        self.criar_tabelas()
-
-    def migrar_banco_dados(self):
-        """Migra o banco de dados para a nova estrutura"""
-        cursor = self.conn.cursor()
-        
-        try:
-            colunas_necessarias = [
-                'cpf_cliente', 
-                'data_compra',
-                'data_registro'
-            ]
-            
-            for coluna in colunas_necessarias:
-                try:
-                    cursor.execute(f"ALTER TABLE vendas ADD COLUMN {coluna} TEXT")
-                except sqlite3.OperationalError:
-                    pass
-            
-            self.conn.commit()
-        except Exception as e:
-            st.error(f"Erro ao migrar banco de dados: {e}")
-
-    def criar_tabelas(self):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS produtos (
-                id INTEGER PRIMARY KEY,
-                nome TEXT NOT NULL UNIQUE,
-                tipo TEXT NOT NULL,
-                valor REAL NOT NULL,
-                quantidade INTEGER,
-                link_download TEXT,
-                descricao TEXT
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vendas (
-                id INTEGER PRIMARY KEY,
-                produto_id INTEGER,
-                cliente TEXT NOT NULL,
-                cpf_cliente TEXT,
-                email_cliente TEXT,
-                quantidade INTEGER,
-                valor_total REAL,
-                forma_pagamento TEXT,
-                data_registro DATETIME,
-                data_compra DATE,
-                status TEXT DEFAULT 'Processando',
-                FOREIGN KEY(produto_id) REFERENCES produtos(id)
-            )
-        ''')
-        self.conn.commit()
-
-    def validar_produto(self, nome, id=None):
-        """Verifica se o produto já existe"""
-        cursor = self.conn.cursor()
-        if id:
-            cursor.execute('SELECT COUNT(*) FROM produtos WHERE nome = ? AND id != ?', (nome, id))
-        else:
-            cursor.execute('SELECT COUNT(*) FROM produtos WHERE nome = ?', (nome,))
-        return cursor.fetchone()[0] == 0
+    def __init__(self):
+        self.sheet = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        self.produtos_sheet = self.sheet.worksheet("Produtos")
+        self.vendas_sheet = self.sheet.worksheet("Vendas")
 
     def cadastrar_produto(self, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
-        cursor = self.conn.cursor()
         try:
-            if not self.validar_produto(nome):
+            produtos = self.produtos_sheet.get_all_records()
+            if any(p['nome'] == nome for p in produtos):
                 raise ValueError("Já existe um produto com este nome")
 
-            cursor.execute('''
-                INSERT INTO produtos (nome, tipo, valor, quantidade, link_download, descricao) 
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (nome, tipo, valor, quantidade, link_download, descricao))
-            self.conn.commit()
+            novo_id = len(produtos) + 1
+            self.produtos_sheet.append_row([
+                novo_id, nome, tipo, valor, quantidade, link_download, descricao
+            ])
             return True
         except Exception as e:
             st.error(f"Erro ao cadastrar produto: {e}")
             return False
 
     def editar_produto(self, id, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
-        cursor = self.conn.cursor()
         try:
-            if not self.validar_produto(nome, id):
+            produtos = self.produtos_sheet.get_all_records()
+            if any(p['nome'] == nome and p['id'] != id for p in produtos):
                 raise ValueError("Já existe outro produto com este nome")
 
-            cursor.execute('''
-                UPDATE produtos 
-                SET nome=?, tipo=?, valor=?, quantidade=?, link_download=?, descricao=?
-                WHERE id=?
-            ''', (nome, tipo, valor, quantidade, link_download, descricao, id))
-            self.conn.commit()
+            row = self.produtos_sheet.find(str(id)).row
+            self.produtos_sheet.update(f'A{row}:G{row}', [[
+                id, nome, tipo, valor, quantidade, link_download, descricao
+            ]])
             return True
         except Exception as e:
             st.error(f"Erro ao editar produto: {e}")
             return False
 
     def remover_produto(self, id):
-        cursor = self.conn.cursor()
         try:
-            cursor.execute('DELETE FROM produtos WHERE id = ?', (id,))
-            self.conn.commit()
+            row = self.produtos_sheet.find(str(id)).row
+            self.produtos_sheet.delete_rows(row)
             return True
         except Exception as e:
             st.error(f"Erro ao remover produto: {e}")
             return False
 
     def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
-        cursor = self.conn.cursor()
-        
-        if cpf and not validar_cpf(cpf):
-            st.warning("CPF inválido. A venda será registrada, mas verifique o CPF.")
-        
-        cpf_formatado = formatar_cpf(cpf) if cpf else None
-        
-        cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
-        produto = cursor.fetchone()
-        
-        if not produto:
-            raise ValueError("Produto não encontrado")
-        
-        valor_unitario, tipo_produto, estoque_atual = produto
-        
-        if tipo_produto in ['Card', 'Físico'] and (estoque_atual is None or quantidade > estoque_atual):
-            raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual or 0}")
-        
-        valor_total = valor_unitario * quantidade
-        data_registro = datetime.now()
-        
-        if not data_compra:
-            data_compra = data_registro.date()
+        try:
+            if cpf and not validar_cpf(cpf):
+                st.warning("CPF inválido. A venda será registrada, mas verifique o CPF.")
+            
+            cpf_formatado = formatar_cpf(cpf) if cpf else None
+            
+            produtos = self.produtos_sheet.get_all_records()
+            produto = next((p for p in produtos if p['id'] == produto_id), None)
+            
+            if not produto:
+                raise ValueError("Produto não encontrado")
+            
+            valor_unitario = produto['valor']
+            tipo_produto = produto['tipo']
+            estoque_atual = produto['quantidade']
+            
+            if tipo_produto in ['Card', 'Físico'] and (estoque_atual is None or quantidade > estoque_atual):
+                raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual or 0}")
+            
+            valor_total = valor_unitario * quantidade
+            data_registro = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            if not data_compra:
+                data_compra = datetime.now().date().strftime("%Y-%m-%d")
 
-        cursor.execute('''
-            INSERT INTO vendas (
-                produto_id, cliente, cpf_cliente, email_cliente, quantidade, 
-                valor_total, forma_pagamento, data_registro, data_compra
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            produto_id, 
-            cliente, 
-            cpf_formatado, 
-            email, 
-            quantidade, 
-            valor_total, 
-            forma_pagamento, 
-            data_registro,
-            data_compra
-        ))
-        
-        if tipo_produto in ['Card', 'Físico']:
-            cursor.execute('''
-                UPDATE produtos 
-                SET quantidade = quantidade - ? 
-                WHERE id = ?
-            ''', (quantidade, produto_id))
-        
-        self.conn.commit()
-        return True
+            vendas = self.vendas_sheet.get_all_records()
+            novo_id = len(vendas) + 1
+            
+            self.vendas_sheet.append_row([
+                novo_id, produto_id, cliente, cpf_formatado, email, quantidade,
+                valor_total, forma_pagamento, data_registro, data_compra, "Processando"
+            ])
+            
+            if tipo_produto in ['Card', 'Físico']:
+                row = self.produtos_sheet.find(str(produto_id)).row
+                novo_estoque = estoque_atual - quantidade
+                self.produtos_sheet.update_cell(row, 5, novo_estoque)
+            
+            return True
+        except Exception as e:
+            st.error(f"Erro ao registrar venda: {e}")
+            return False
 
     def editar_venda(self, id, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
-        cursor = self.conn.cursor()
         try:
             if cpf and not validar_cpf(cpf):
                 st.warning("CPF inválido. A venda será atualizada, mas verifique o CPF.")
             
             cpf_formatado = formatar_cpf(cpf) if cpf else None
             
-            # Obter informações da venda atual
-            cursor.execute('SELECT produto_id, quantidade FROM vendas WHERE id = ?', (id,))
-            venda_atual = cursor.fetchone()
+            vendas = self.vendas_sheet.get_all_records()
+            venda_atual = next((v for v in vendas if v['id'] == id), None)
             if not venda_atual:
                 raise ValueError("Venda não encontrada")
             
-            produto_id_atual, quantidade_atual = venda_atual
-            
-            # Obter informações do produto
-            cursor.execute('SELECT valor, tipo, quantidade FROM produtos WHERE id = ?', (produto_id,))
-            produto = cursor.fetchone()
+            produtos = self.produtos_sheet.get_all_records()
+            produto = next((p for p in produtos if p['id'] == produto_id), None)
             if not produto:
                 raise ValueError("Produto não encontrado")
             
-            valor_unitario, tipo_produto, estoque_atual = produto
+            valor_unitario = produto['valor']
+            tipo_produto = produto['tipo']
+            estoque_atual = produto['quantidade']
             
-            # Ajustar estoque
             if tipo_produto in ['Card', 'Físico']:
-                estoque_ajustado = estoque_atual + quantidade_atual - quantidade
+                estoque_ajustado = estoque_atual + venda_atual['quantidade'] - quantidade
                 if estoque_ajustado < 0:
                     raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual}")
                 
-                cursor.execute('''
-                    UPDATE produtos 
-                    SET quantidade = ?
-                    WHERE id = ?
-                ''', (estoque_ajustado, produto_id))
+                row = self.produtos_sheet.find(str(produto_id)).row
+                self.produtos_sheet.update_cell(row, 5, estoque_ajustado)
             
             valor_total = valor_unitario * quantidade
             
-            cursor.execute('''
-                UPDATE vendas 
-                SET produto_id=?, cliente=?, cpf_cliente=?, email_cliente=?, 
-                    quantidade=?, valor_total=?, forma_pagamento=?, data_compra=?
-                WHERE id=?
-            ''', (produto_id, cliente, cpf_formatado, email, quantidade, 
-                  valor_total, forma_pagamento, data_compra, id))
+            row = self.vendas_sheet.find(str(id)).row
+            self.vendas_sheet.update(f'A{row}:K{row}', [[
+                id, produto_id, cliente, cpf_formatado, email, quantidade,
+                valor_total, forma_pagamento, venda_atual['data_registro'], data_compra, venda_atual['status']
+            ]])
             
-            self.conn.commit()
             return True
         except Exception as e:
             st.error(f"Erro ao editar venda: {e}")
             return False
 
     def remover_venda(self, id):
-        cursor = self.conn.cursor()
         try:
-            # Obter informações da venda
-            cursor.execute('SELECT produto_id, quantidade FROM vendas WHERE id = ?', (id,))
-            venda = cursor.fetchone()
+            vendas = self.vendas_sheet.get_all_records()
+            venda = next((v for v in vendas if v['id'] == id), None)
             if not venda:
                 raise ValueError("Venda não encontrada")
             
-            produto_id, quantidade = venda
+            produtos = self.produtos_sheet.get_all_records()
+            produto = next((p for p in produtos if p['id'] == venda['produto_id']), None)
             
-            # Verificar o tipo do produto
-            cursor.execute('SELECT tipo FROM produtos WHERE id = ?', (produto_id,))
-            tipo_produto = cursor.fetchone()[0]
+            if produto['tipo'] in ['Card', 'Físico']:
+                row = self.produtos_sheet.find(str(venda['produto_id'])).row
+                novo_estoque = produto['quantidade'] + venda['quantidade']
+                self.produtos_sheet.update_cell(row, 5, novo_estoque)
             
-            # Ajustar estoque se for produto físico ou card
-            if tipo_produto in ['Card', 'Físico']:
-                cursor.execute('''
-                    UPDATE produtos 
-                    SET quantidade = quantidade + ? 
-                    WHERE id = ?
-                ''', (quantidade, produto_id))
-            
-            # Remover a venda
-            cursor.execute('DELETE FROM vendas WHERE id = ?', (id,))
-            self.conn.commit()
+            row = self.vendas_sheet.find(str(id)).row
+            self.vendas_sheet.delete_rows(row)
             return True
         except Exception as e:
             st.error(f"Erro ao remover venda: {e}")
             return False
 
     def listar_produtos(self):
-        return pd.read_sql_query("SELECT * FROM produtos", self.conn)
+        return pd.DataFrame(self.produtos_sheet.get_all_records())
 
     def listar_vendas(self):
-        return pd.read_sql_query("""
-            SELECT 
-                v.id, 
-                p.nome as produto, 
-                p.tipo as tipo_produto,
-                v.cliente, 
-                v.cpf_cliente,
-                v.email_cliente,
-                v.quantidade, 
-                v.valor_total, 
-                v.forma_pagamento,
-                v.data_registro,
-                v.data_compra,
-                v.status
-            FROM vendas v
-            JOIN produtos p ON v.produto_id = p.id
-            ORDER BY v.data_registro DESC
-        """, self.conn)
+        vendas = pd.DataFrame(self.vendas_sheet.get_all_records())
+        produtos = pd.DataFrame(self.produtos_sheet.get_all_records())
+        return vendas.merge(produtos[['id', 'nome', 'tipo']], left_on='produto_id', right_on='id', suffixes=('', '_produto'))
 
     def exportar_excel(self, tipo='vendas'):
         if tipo == 'vendas':
@@ -483,7 +379,7 @@ def listar_vendas_ui(gestao):
             with st.expander(f"Venda {row['id']} - {row['cliente']}"):
                 col1, col2, col3 = st.columns([3,1,1])
                 with col1:
-                    st.write(f"**Produto:** {row['produto']}")
+                    st.write(f"**Produto:** {row['nome']}")
                     st.write(f"**Quantidade:** {row['quantidade']}")
                     st.write(f"**Valor Total:** R$ {row['valor_total']:.2f}")
                     st.write(f"**Data da Compra:** {row['data_compra']}")
@@ -507,7 +403,7 @@ def listar_vendas_ui(gestao):
             with st.form(key=f"edit_sale_{venda['id']}"):
                 produtos = gestao.listar_produtos()
                 opcoes_produtos = dict(zip(produtos['nome'], produtos['id']))
-                produto_selecionado = st.selectbox("Produto", list(opcoes_produtos.keys()), index=list(opcoes_produtos.keys()).index(venda['produto']))
+                produto_selecionado = st.selectbox("Produto", list(opcoes_produtos.keys()), index=list(opcoes_produtos.keys()).index(venda['nome']))
                 cliente = st.text_input("Nome do Cliente", value=venda['cliente'])
                 cpf = st.text_input("CPF do Cliente (opcional)", value=venda['cpf_cliente'] if venda['cpf_cliente'] else "")
                 email = st.text_input("Email do Cliente", value=venda['email_cliente'] if venda['email_cliente'] else "")
@@ -558,28 +454,33 @@ def visualizar_planilha_ui(gestao):
 
 def main():
     st.set_page_config(
-        page_title="MEDIX - Gestão de Produtos", 
+        page_title="MEDIX - Gestão de Produtos",
         page_icon="🩺",
         layout="wide"
     )
     
     st.markdown("""
     <style>
+    .sidebar .sidebar-content {
+        background-color: #f0f2f6;
+    }
+    .sidebar .sidebar-content .stRadio > div {
+        background-color: #ffffff;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 10px;
+    }
+    .sidebar .sidebar-content .stRadio > div:hover {
+        background-color: #e6e9ef;
+    }
     .big-font {
-        font-size:20px !important;
+        font-size: 20px !important;
         color: #0083B8;
     }
     .highlight {
         background-color: #F0F2F6;
         padding: 10px;
         border-radius: 5px;
-    }
-    .sidebar .sidebar-content {
-        background-image: linear-gradient(#2e7bcf,#2e7bcf);
-        color: white;
-    }
-    .sidebar .sidebar-content .stRadio > label {
-        color: white !important;
     }
     </style>
     """, unsafe_allow_html=True)
