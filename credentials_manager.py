@@ -5,6 +5,9 @@ from google.oauth2.service_account import Credentials
 from google.oauth2 import service_account
 import tempfile
 import logging
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, 
@@ -23,71 +26,104 @@ SCOPES = [
 
 def get_credentials():
     """
-    Obtém as credenciais para a API do Google, verificando diversas fontes:
-    1. Segredos do Streamlit (ambiente de produção)
-    2. Variáveis de ambiente
-    3. Arquivo local de credenciais
-    4. Credenciais embutidas (apenas para desenvolvimento)
+    Obtém as credenciais para a API do Google, tentando várias abordagens:
+    1. Arquivo de token salvo
+    2. OAuth 2.0 usando ID do cliente e segredo
+    3. Conta de serviço do arquivo google_credentials.json
+    4. Segredos do Streamlit
     """
     
-    # 1. Tentar obter a partir dos segredos do Streamlit
-    if 'gcp_service_account' in st.secrets:
+    # Tentar obter de token OAuth salvo
+    if os.path.exists('token.pickle'):
         try:
-            # Verificar se a chave privada não é um placeholder
-            pk = st.secrets["gcp_service_account"].get("private_key", "")
-            if "YOUR_PRIVATE_KEY_HERE" in pk:
-                logging.error("A chave privada em st.secrets é um placeholder. Substitua pela chave real.")
-                return None
-                
-            logging.info("Usando credenciais dos segredos do Streamlit")
-            return service_account.Credentials.from_service_account_info(
-                st.secrets["gcp_service_account"],
-                scopes=SCOPES
-            )
+            with open('token.pickle', 'rb') as token:
+                creds = pickle.load(token)
+                if creds and creds.valid:
+                    logging.info("Usando credenciais OAuth2 do arquivo token.pickle")
+                    return creds
+                elif creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                    # Salvar as credenciais atualizadas
+                    with open('token.pickle', 'wb') as token:
+                        pickle.dump(creds, token)
+                    logging.info("Credenciais OAuth2 atualizadas e salvas")
+                    return creds
         except Exception as e:
-            logging.error(f"Erro ao usar credenciais do Streamlit: {e}")
-            # Continuar para o próximo método
+            logging.warning(f"Erro ao carregar token OAuth: {e}")
     
-    # 2. Tentar obter de variáveis de ambiente
-    if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
-        try:
-            logging.info("Usando credenciais do arquivo definido em GOOGLE_APPLICATION_CREDENTIALS")
-            return Credentials.from_service_account_file(
-                os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'),
-                scopes=SCOPES
-            )
-        except Exception as e:
-            logging.error(f"Erro ao usar credenciais de variável de ambiente: {e}")
-            # Continuar para o próximo método
+    # Tentar obter via OAuth2 usando ID e segredo do cliente
+    try:
+        # Criar arquivo de configuração do cliente
+        client_config = {
+            "installed": {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
+            }
+        }
+        
+        # Salvar temporariamente para uso com InstalledAppFlow
+        with open('client_config.json', 'w') as f:
+            json.dump(client_config, f)
+            
+        # Criar e iniciar o fluxo de autenticação
+        flow = InstalledAppFlow.from_client_secrets_file(
+            'client_config.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+        
+        # Remover arquivo temporário
+        os.remove('client_config.json')
+        
+        # Salvar as credenciais para uso futuro
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+        
+        logging.info("Novas credenciais OAuth2 obtidas e salvas")
+        return creds
+    except Exception as e:
+        logging.error(f"Erro ao obter credenciais via OAuth2: {e}")
     
-    # 3. Verificar se existe um arquivo de credenciais local
+    # 3. Verificar se existe um arquivo de credenciais de conta de serviço
     if os.path.exists('google_credentials.json'):
         try:
             # Verificar se a chave privada não é um placeholder
             with open('google_credentials.json', 'r') as f:
                 cred_content = json.load(f)
                 pk = cred_content.get("private_key", "")
-                if "YOUR_PRIVATE_KEY_HERE" in pk:
+                if "SUBSTITUA" in pk or "YOUR_PRIVATE_KEY" in pk:
                     logging.error("A chave privada em google_credentials.json é um placeholder. Substitua pela chave real.")
-                    return None
-                    
-            logging.info("Usando credenciais do arquivo local google_credentials.json")
-            return Credentials.from_service_account_file(
-                'google_credentials.json',
-                scopes=SCOPES
-            )
+                else:    
+                    logging.info("Usando credenciais do arquivo local google_credentials.json")
+                    return Credentials.from_service_account_file(
+                        'google_credentials.json',
+                        scopes=SCOPES
+                    )
         except Exception as e:
             logging.error(f"Erro ao usar credenciais do arquivo local: {e}")
-            # Continuar para o próximo método
     
-    # 4. Usar credenciais embutidas para desenvolvimento (não recomendado para produção)
-    try:
-        logging.warning("AVISO: Usando credenciais temporárias embutidas. Isso não é recomendado para produção.")
-        return create_temporary_credentials()
-    except Exception as e:
-        logging.error(f"Erro ao criar credenciais temporárias: {e}")
-        return None
+    # 4. Tentar obter a partir dos segredos do Streamlit
+    if 'gcp_service_account' in st.secrets:
+        try:
+            # Verificar se a chave privada não é um placeholder
+            pk = st.secrets["gcp_service_account"].get("private_key", "")
+            if "YOUR_PRIVATE_KEY_HERE" in pk:
+                logging.error("A chave privada em st.secrets é um placeholder. Substitua pela chave real.")
+            else:    
+                logging.info("Usando credenciais dos segredos do Streamlit")
+                return service_account.Credentials.from_service_account_info(
+                    st.secrets["gcp_service_account"],
+                    scopes=SCOPES
+                )
+        except Exception as e:
+            logging.error(f"Erro ao usar credenciais do Streamlit: {e}")
+    
+    logging.error("Não foi possível obter credenciais válidas por nenhum método")
+    return None
 
+# Função para criar credenciais temporárias (fallback, não recomendado para produção)
 def create_temporary_credentials():
     """
     Cria um arquivo temporário com credenciais para desenvolvimento.
