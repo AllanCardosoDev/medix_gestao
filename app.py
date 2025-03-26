@@ -10,6 +10,7 @@ import json
 import uuid
 import plotly.express as px
 import plotly.graph_objects as go
+from credentials_manager import get_credentials  # Novo import para o gerenciador de credenciais
 
 # Tentar importar bibliotecas do Google, mas não falhar se não estiverem disponíveis
 try:
@@ -67,50 +68,21 @@ def formatar_cpf(cpf):
     cpf = re.sub(r'\D', '', cpf)
     return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
 
-def criar_arquivo_credenciais():
-    """Cria um arquivo de credenciais temporário para a autenticação Google."""
-    credentials_info = {
-        "type": "service_account",
-        "project_id": "medix-system",
-        "private_key_id": str(uuid.uuid4()),
-        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA0T/5Q/+lhrZ3p0SV\n1QHE+vXdw8PIWXDA1SNfBQVrAU5QzMX/6aBD4PsI+S5wVpGwQg5y7YLNkzAgjOBB\nkTiR4wIDAQABAkA9u9ks+rLWRlg9nCQ9cj5x1dLkf1R1sJj+wI0JNLKL1Hb1NZLC\n2pX2QWpIU5i9MfZ5+BB1CPXKu5SnPzOjBYphAiEA97HJt1YfBUzFWEcpweDLu7fJ\nVNzcpUm1FNM8mCt8LnkCIQDYfPGRW7QVuN1KsGySVJnMGD8k1Wir2pcUJ34JRoqZ\nixkZ2wIgTQtTQUKCPXwcIcZR3RZG/l4j+QRBGXx0lM5LbQl+c6kCIQDSFNtGBkxX\n4+GvLpwWX5/jCCeR/+GCw9nMlvzILXeTZwIhAJJfGwKUhECMACPyGfSBDHF5e1CX\nGOQVY2Qxijy9jTxL\n-----END PRIVATE KEY-----\n",
-        "client_email": "medix-service@medix-system.iam.gserviceaccount.com",
-        "client_id": "1072458931980-mpf2loc5b26l3j5ke1hf0fhghnrfv6i1.apps.googleusercontent.com",
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/medix-service%40medix-system.iam.gserviceaccount.com"
-    }
-    
-    with open('credentials.json', 'w') as f:
-        json.dump(credentials_info, f)
-    
-    return 'credentials.json'
-
 def autenticar_google():
-    """Autentica com a API do Google usando OAuth2."""
+    """Autentica com a API do Google usando o gerenciador de credenciais."""
     if not google_imports_successful:
         st.error("Bibliotecas do Google não estão disponíveis. Verifique se estão instaladas corretamente.")
         return None
         
     try:
-        # Verificar secrets do Streamlit primeiro
-        if 'gcp_service_account' in st.secrets:
-            return service_account.Credentials.from_service_account_info(
-                st.secrets["gcp_service_account"],
-                scopes=SCOPES
-            )
-            
-        # Se você já tiver o arquivo JSON de credenciais (preferível):
-        elif os.path.exists('google_credentials.json'):
-            return Credentials.from_service_account_file('google_credentials.json', scopes=SCOPES)
+        # Usar o gerenciador de credenciais para obter as credenciais
+        credentials = get_credentials()
+        if credentials:
+            logging.info("Credenciais obtidas com sucesso do gerenciador de credenciais")
+            return credentials
         else:
-            # Usamos credenciais alternativas com método de autenticação OAuth2
-            # Nota: Em produção, é melhor usar um arquivo de credenciais real
-            st.warning("Usando autenticação alternativa. Para melhor segurança, use um arquivo de credenciais.")
-            credentials_file = criar_arquivo_credenciais()
-            return Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
-        
+            logging.error("Falha ao obter credenciais - objeto de credenciais é None")
+            return None
     except Exception as e:
         logging.error(f"Erro na autenticação: {e}")
         st.error(f"Erro na autenticação com Google API: {e}")
@@ -458,13 +430,16 @@ class GestaoVendasGoogleSheets:
         
         # Tentar autenticar e inicializar
         try:
+            logging.info("Iniciando autenticação com Google API")
             self.creds = autenticar_google()
             if self.creds:
+                logging.info("Credenciais obtidas com sucesso, configurando serviços")
                 self.drive_service = build('drive', 'v3', credentials=self.creds)
                 self.sheets_service = build('sheets', 'v4', credentials=self.creds)
                 self.gc = gspread.authorize(self.creds)
                 
                 # Inicializa as planilhas se não existirem
+                logging.info("Inicializando planilhas")
                 self.sheets = self.inicializar_planilhas()
                 if self.sheets:
                     self.produtos_sheet = self.sheets.worksheet("Produtos")
@@ -473,6 +448,11 @@ class GestaoVendasGoogleSheets:
                     # Verifica e corrige headers das planilhas se necessário
                     self.verificar_headers()
                     self.autenticado = True
+                    logging.info("Autenticação e inicialização das planilhas concluídas com sucesso")
+                else:
+                    logging.error("Falha ao inicializar planilhas")
+            else:
+                logging.error("Falha ao obter credenciais - objeto de credenciais é None")
         except Exception as e:
             logging.error(f"Erro na inicialização do Google Sheets: {e}")
     
@@ -491,9 +471,11 @@ class GestaoVendasGoogleSheets:
                 # Usa a planilha existente
                 spreadsheet_id = files[0]['id']
                 spreadsheet = self.gc.open_by_key(spreadsheet_id)
+                logging.info(f"Usando planilha existente: {spreadsheet_id}")
             else:
                 # Cria uma nova planilha
                 spreadsheet = self.gc.create('MEDIX_Sistema')
+                logging.info(f"Criando nova planilha: {spreadsheet.id}")
                 
                 # Move a planilha para a pasta especificada
                 file_id = spreadsheet.id
@@ -536,7 +518,8 @@ class GestaoVendasGoogleSheets:
                         "id", "nome", "tipo", "valor", "quantidade", 
                         "link_download", "descricao", "data_cadastro"
                     ], 1)
-            except Exception:
+            except Exception as e:
+                logging.warning(f"Erro ao verificar headers de produtos: {e}")
                 self.produtos_sheet.insert_row([
                     "id", "nome", "tipo", "valor", "quantidade", 
                     "link_download", "descricao", "data_cadastro"
@@ -551,7 +534,8 @@ class GestaoVendasGoogleSheets:
                         "email_cliente", "quantidade", "valor_total", "forma_pagamento",
                         "data_registro", "data_compra", "status"
                     ], 1)
-            except Exception:
+            except Exception as e:
+                logging.warning(f"Erro ao verificar headers de vendas: {e}")
                 self.vendas_sheet.insert_row([
                     "id", "produto_id", "produto_nome", "cliente", "cpf_cliente",
                     "email_cliente", "quantidade", "valor_total", "forma_pagamento",
@@ -947,8 +931,10 @@ class GestaoVendasGoogleSheets:
 
 # Seleciona o gestor de dados apropriado (Google Sheets ou Local)
 def get_gestao():
+    """Seleciona e inicializa o gestor de dados apropriado (Google Sheets ou Local)."""
     if 'gestao' not in st.session_state:
         # Tenta inicializar a gestão com Google Sheets
+        logging.info("Tentando inicializar gestão com Google Sheets")
         gestao_google = GestaoVendasGoogleSheets()
         
         # Verifica se a autenticação foi bem-sucedida
@@ -960,7 +946,8 @@ def get_gestao():
             # Fallback para gestão local
             st.session_state.gestao = GestaoVendasLocal()
             st.session_state.usando_google = False
-            logging.info("Usando gestão local (fallback)")
+            logging.warning("Autenticação com Google falhou. Usando gestão local (fallback)")
+            st.warning("Não foi possível conectar ao Google Drive. Usando armazenamento local.")
     
     return st.session_state.gestao
 
@@ -1231,6 +1218,97 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/medix-
                 3. Cole o template e substitua os valores
                 4. Clique em Save
                 """)
+                
+        # ADICIONE ESTA NOVA SEÇÃO PARA SOLUÇÃO DE PROBLEMAS DE AUTENTICAÇÃO
+        st.subheader("🔧 Solução de Problemas de Autenticação")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Executar Gerenciador de Credenciais"):
+                try:
+                    from credentials_manager import get_credentials
+                    with st.spinner("Executando gerenciador de credenciais..."):
+                        creds = get_credentials()
+                        if creds:
+                            st.success("✅ Credenciais obtidas com sucesso!")
+                            st.info("Reinicie o aplicativo para aplicar as credenciais.")
+                        else:
+                            st.error("❌ Falha ao obter credenciais.")
+                except Exception as e:
+                    st.error(f"❌ Erro ao executar gerenciador de credenciais: {e}")
+        
+        with col2:
+            if st.button("🔍 Diagnosticar Problema"):
+                with st.spinner("Analisando problema de autenticação..."):
+                    try:
+                        # Verificar se o arquivo de credenciais existe
+                        if os.path.exists('google_credentials.json'):
+                            st.success("✅ Arquivo de credenciais encontrado: google_credentials.json")
+                            try:
+                                with open('google_credentials.json', 'r') as f:
+                                    cred_content = json.load(f)
+                                    # Verificar campos essenciais
+                                    campos_verificados = [
+                                        "type" in cred_content,
+                                        "project_id" in cred_content,
+                                        "private_key_id" in cred_content,
+                                        "private_key" in cred_content,
+                                        "client_email" in cred_content
+                                    ]
+                                    
+                                    if all(campos_verificados):
+                                        st.success("✅ Formato do arquivo de credenciais parece correto")
+                                        
+                                        # Verificar se a private_key é válida
+                                        pk = cred_content.get("private_key", "")
+                                        if "YOUR_PRIVATE_KEY_HERE" in pk or "PRIVATE_KEY" not in pk:
+                                            st.error("❌ Chave privada parece ser um placeholder. Substitua pela chave real.")
+                                        else:
+                                            st.success("✅ Formato da chave privada parece correto")
+                                    else:
+                                        st.error("❌ Arquivo de credenciais está incompleto")
+                            except json.JSONDecodeError:
+                                st.error("❌ Arquivo de credenciais não é um JSON válido")
+                            except Exception as e:
+                                st.error(f"❌ Erro ao analisar arquivo de credenciais: {e}")
+                        else:
+                            st.warning("⚠️ Arquivo google_credentials.json não encontrado")
+                            
+                            # Verificar secrets do Streamlit
+                            if 'gcp_service_account' in st.secrets:
+                                st.success("✅ Credenciais encontradas em st.secrets")
+                                
+                                # Verificar campos em st.secrets
+                                secrets_creds = st.secrets["gcp_service_account"]
+                                campos_verificados = [
+                                    "type" in secrets_creds,
+                                    "project_id" in secrets_creds,
+                                    "private_key_id" in secrets_creds,
+                                    "private_key" in secrets_creds,
+                                    "client_email" in secrets_creds
+                                ]
+                                
+                                if all(campos_verificados):
+                                    st.success("✅ Formato das credenciais em st.secrets parece correto")
+                                    
+                                    # Verificar se a private_key é válida
+                                    pk = secrets_creds.get("private_key", "")
+                                    if "YOUR_PRIVATE_KEY_HERE" in pk or "PRIVATE_KEY" not in pk:
+                                        st.error("❌ Chave privada parece ser um placeholder. Substitua pela chave real.")
+                                    else:
+                                        st.success("✅ Formato da chave privada parece correto")
+                                else:
+                                    st.error("❌ Credenciais em st.secrets estão incompletas")
+                            else:
+                                st.error("❌ Credenciais não encontradas em nenhum lugar conhecido")
+                                st.info("Você precisa adicionar suas credenciais do Google em um dos seguintes locais:")
+                                st.markdown("""
+                                1. Arquivo `google_credentials.json` na raiz do projeto
+                                2. Em secrets do Streamlit (`st.secrets["gcp_service_account"]`)
+                                3. Na variável de ambiente GOOGLE_APPLICATION_CREDENTIALS
+                                """)
+                    except Exception as e:
+                        st.error(f"❌ Erro durante o diagnóstico: {e}")
     
     # Informações do Sistema
     st.subheader("ℹ️ Informações do Sistema")
