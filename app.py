@@ -6,19 +6,31 @@ import io
 import os
 import logging
 import time
-import gspread
-from google.oauth2.service_account import Credentials
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import json
 import uuid
 import plotly.express as px
 import plotly.graph_objects as go
-from streamlit_option_menu import option_menu
+
+# Tentar importar bibliotecas do Google, mas não falhar se não estiverem disponíveis
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    google_imports_successful = True
+except ImportError:
+    google_imports_successful = False
+
+# Tentar importar o menu de opções
+try:
+    from streamlit_option_menu import option_menu
+    option_menu_available = True
+except ImportError:
+    option_menu_available = False
 
 # Configuração de logging
-logging.basicConfig(filename='app.log', level=logging.DEBUG, 
+logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Configurações do Google API
@@ -77,45 +89,392 @@ def criar_arquivo_credenciais():
 
 def autenticar_google():
     """Autentica com a API do Google usando OAuth2."""
+    if not google_imports_successful:
+        st.error("Bibliotecas do Google não estão disponíveis. Verifique se estão instaladas corretamente.")
+        return None
+        
     try:
+        # Verificar secrets do Streamlit primeiro
+        if 'gcp_service_account' in st.secrets:
+            return service_account.Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"],
+                scopes=SCOPES
+            )
+            
         # Se você já tiver o arquivo JSON de credenciais (preferível):
-        if os.path.exists('google_credentials.json'):
-            creds = Credentials.from_service_account_file('google_credentials.json', scopes=SCOPES)
+        elif os.path.exists('google_credentials.json'):
+            return Credentials.from_service_account_file('google_credentials.json', scopes=SCOPES)
         else:
             # Usamos credenciais alternativas com método de autenticação OAuth2
             # Nota: Em produção, é melhor usar um arquivo de credenciais real
             st.warning("Usando autenticação alternativa. Para melhor segurança, use um arquivo de credenciais.")
             credentials_file = criar_arquivo_credenciais()
-            creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
+            return Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
         
-        return creds
     except Exception as e:
         logging.error(f"Erro na autenticação: {e}")
         st.error(f"Erro na autenticação com Google API: {e}")
         return None
 
+# Classe para gerenciamento com storage local (fallback quando Google falha)
+class GestaoVendasLocal:
+    def __init__(self):
+        self.produtos = []
+        self.vendas = []
+        self.next_produto_id = 1
+        self.next_venda_id = 1
+        # Carregar dados se existirem
+        self.carregar_dados()
+    
+    def carregar_dados(self):
+        try:
+            if os.path.exists('produtos_local.json'):
+                with open('produtos_local.json', 'r') as f:
+                    self.produtos = json.load(f)
+                if self.produtos:
+                    self.next_produto_id = max([p.get('id', 0) for p in self.produtos]) + 1
+            
+            if os.path.exists('vendas_local.json'):
+                with open('vendas_local.json', 'r') as f:
+                    self.vendas = json.load(f)
+                if self.vendas:
+                    self.next_venda_id = max([v.get('id', 0) for v in self.vendas]) + 1
+        except Exception as e:
+            logging.error(f"Erro ao carregar dados locais: {e}")
+            st.error(f"Erro ao carregar dados locais: {e}")
+    
+    def salvar_dados(self):
+        try:
+            with open('produtos_local.json', 'w') as f:
+                json.dump(self.produtos, f)
+            
+            with open('vendas_local.json', 'w') as f:
+                json.dump(self.vendas, f)
+        except Exception as e:
+            logging.error(f"Erro ao salvar dados locais: {e}")
+            st.error(f"Erro ao salvar dados locais: {e}")
+    
+    def validar_produto(self, nome, id=None):
+        if id:
+            return not any(p['nome'] == nome and p['id'] != id for p in self.produtos)
+        else:
+            return not any(p['nome'] == nome for p in self.produtos)
+    
+    def cadastrar_produto(self, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
+        try:
+            if not self.validar_produto(nome):
+                raise ValueError("Já existe um produto com este nome")
+            
+            produto = {
+                'id': self.next_produto_id,
+                'nome': nome,
+                'tipo': tipo,
+                'valor': float(valor),
+                'quantidade': int(quantidade or 0),
+                'link_download': link_download or "",
+                'descricao': descricao or "",
+                'data_cadastro': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            self.produtos.append(produto)
+            self.next_produto_id += 1
+            self.salvar_dados()
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao cadastrar produto: {e}")
+            st.error(f"Erro ao cadastrar produto: {e}")
+            return False
+    
+    def editar_produto(self, id, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
+        try:
+            if not self.validar_produto(nome, id):
+                raise ValueError("Já existe outro produto com este nome")
+            
+            for produto in self.produtos:
+                if produto['id'] == id:
+                    produto['nome'] = nome
+                    produto['tipo'] = tipo
+                    produto['valor'] = float(valor)
+                    produto['quantidade'] = int(quantidade or 0)
+                    produto['link_download'] = link_download or ""
+                    produto['descricao'] = descricao or ""
+                    self.salvar_dados()
+                    return True
+            
+            raise ValueError(f"Produto com ID {id} não encontrado")
+        except Exception as e:
+            logging.error(f"Erro ao editar produto: {e}")
+            st.error(f"Erro ao editar produto: {e}")
+            return False
+    
+    def remover_produto(self, id):
+        try:
+            # Verificar se há vendas associadas
+            if any(v['produto_id'] == id for v in self.vendas):
+                raise ValueError("Não é possível remover um produto que possui vendas associadas")
+            
+            produto_encontrado = False
+            for i, produto in enumerate(self.produtos):
+                if produto['id'] == id:
+                    self.produtos.pop(i)
+                    produto_encontrado = True
+                    break
+            
+            if not produto_encontrado:
+                raise ValueError(f"Produto com ID {id} não encontrado")
+            
+            self.salvar_dados()
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao remover produto: {e}")
+            st.error(f"Erro ao remover produto: {str(e)}")
+            return False
+    
+    def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
+        try:
+            if cpf and not validar_cpf(cpf):
+                raise ValueError("CPF inválido")
+            
+            cpf_formatado = formatar_cpf(cpf) if cpf else ""
+            
+            # Encontrar o produto
+            produto = None
+            for p in self.produtos:
+                if p['id'] == produto_id:
+                    produto = p
+                    break
+            
+            if not produto:
+                raise ValueError("Produto não encontrado")
+            
+            nome_produto = produto['nome']
+            valor_unitario = float(produto['valor'])
+            tipo_produto = produto['tipo']
+            
+            # Verificar estoque
+            if tipo_produto in ['Card', 'Material Físico']:
+                estoque_atual = int(produto['quantidade'])
+                if quantidade > estoque_atual:
+                    raise ValueError(f"Estoque insuficiente. Disponível: {estoque_atual}")
+                
+                # Atualizar estoque
+                produto['quantidade'] = estoque_atual - quantidade
+            
+            # Formatar datas
+            data_registro = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not data_compra:
+                data_compra = datetime.now().strftime("%Y-%m-%d")
+            elif isinstance(data_compra, datetime):
+                data_compra = data_compra.strftime("%Y-%m-%d")
+            
+            valor_total = valor_unitario * quantidade
+            
+            venda = {
+                'id': self.next_venda_id,
+                'produto_id': produto_id,
+                'produto_nome': nome_produto,
+                'cliente': cliente,
+                'cpf_cliente': cpf_formatado,
+                'email_cliente': email,
+                'quantidade': quantidade,
+                'valor_total': valor_total,
+                'forma_pagamento': forma_pagamento,
+                'data_registro': data_registro,
+                'data_compra': data_compra,
+                'status': "Processando"
+            }
+            
+            self.vendas.append(venda)
+            self.next_venda_id += 1
+            self.salvar_dados()
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao registrar venda: {e}")
+            st.error(f"Erro ao registrar venda: {str(e)}")
+            return False
+    
+    def editar_venda(self, id, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra):
+        try:
+            if cpf and not validar_cpf(cpf):
+                raise ValueError("CPF inválido")
+            
+            cpf_formatado = formatar_cpf(cpf) if cpf else ""
+            
+            # Encontrar a venda
+            venda = None
+            for v in self.vendas:
+                if v['id'] == id:
+                    venda = v
+                    break
+            
+            if not venda:
+                raise ValueError(f"Venda com ID {id} não encontrada")
+            
+            quantidade_atual = int(venda['quantidade'])
+            produto_id_atual = venda['produto_id']
+            
+            # Encontrar o produto
+            produto = None
+            for p in self.produtos:
+                if p['id'] == produto_id:
+                    produto = p
+                    break
+            
+            if not produto:
+                raise ValueError("Produto não encontrado")
+            
+            nome_produto = produto['nome']
+            valor_unitario = float(produto['valor'])
+            tipo_produto = produto['tipo']
+            
+            # Ajustar estoque
+            if tipo_produto in ['Card', 'Material Físico']:
+                # Mesmo produto
+                if produto_id == produto_id_atual:
+                    produto['quantidade'] = int(produto['quantidade']) + quantidade_atual - quantidade
+                    if produto['quantidade'] < 0:
+                        raise ValueError(f"Estoque insuficiente. Disponível: {int(produto['quantidade']) + quantidade}")
+                else:
+                    # Produto diferente
+                    # Devolver estoque do produto anterior
+                    produto_anterior = None
+                    for p in self.produtos:
+                        if p['id'] == produto_id_atual:
+                            produto_anterior = p
+                            break
+                    
+                    if produto_anterior and produto_anterior['tipo'] in ['Card', 'Material Físico']:
+                        produto_anterior['quantidade'] = int(produto_anterior['quantidade']) + quantidade_atual
+                    
+                    # Reduzir estoque do novo produto
+                    if quantidade > int(produto['quantidade']):
+                        raise ValueError(f"Estoque insuficiente. Disponível: {produto['quantidade']}")
+                    
+                    produto['quantidade'] = int(produto['quantidade']) - quantidade
+            
+            # Atualizar dados da venda
+            venda['produto_id'] = produto_id
+            venda['produto_nome'] = nome_produto
+            venda['cliente'] = cliente
+            venda['cpf_cliente'] = cpf_formatado
+            venda['email_cliente'] = email
+            venda['quantidade'] = quantidade
+            venda['valor_total'] = valor_unitario * quantidade
+            venda['forma_pagamento'] = forma_pagamento
+            
+            # Formatar data
+            if isinstance(data_compra, datetime):
+                venda['data_compra'] = data_compra.strftime("%Y-%m-%d")
+            else:
+                venda['data_compra'] = data_compra
+            
+            self.salvar_dados()
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao editar venda: {e}")
+            st.error(f"Erro ao editar venda: {str(e)}")
+            return False
+    
+    def remover_venda(self, id):
+        try:
+            venda_encontrada = False
+            venda = None
+            
+            for i, v in enumerate(self.vendas):
+                if v['id'] == id:
+                    venda = v
+                    venda_encontrada = True
+                    self.vendas.pop(i)
+                    break
+            
+            if not venda_encontrada:
+                raise ValueError(f"Venda com ID {id} não encontrada")
+            
+            # Devolver ao estoque se for produto físico
+            produto_id = venda['produto_id']
+            quantidade = int(venda['quantidade'])
+            
+            for produto in self.produtos:
+                if produto['id'] == produto_id and produto['tipo'] in ['Card', 'Material Físico']:
+                    produto['quantidade'] = int(produto['quantidade']) + quantidade
+                    break
+            
+            self.salvar_dados()
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao remover venda: {e}")
+            st.error(f"Erro ao remover venda: {str(e)}")
+            return False
+    
+    def listar_produtos(self):
+        if not self.produtos:
+            return pd.DataFrame(columns=[
+                'id', 'nome', 'tipo', 'valor', 'quantidade', 
+                'link_download', 'descricao', 'data_cadastro'
+            ])
+        
+        return pd.DataFrame(self.produtos)
+    
+    def listar_vendas(self):
+        if not self.vendas:
+            return pd.DataFrame(columns=[
+                'id', 'produto_id', 'produto_nome', 'cliente', 'cpf_cliente',
+                'email_cliente', 'quantidade', 'valor_total', 'forma_pagamento',
+                'data_registro', 'data_compra', 'status'
+            ])
+        
+        return pd.DataFrame(self.vendas)
+    
+    def realizar_backup(self):
+        try:
+            # Timestamp para o nome do arquivo
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"MEDIX_backup_local_{timestamp}.json"
+            
+            backup_data = {
+                'produtos': self.produtos,
+                'vendas': self.vendas
+            }
+            
+            with open(backup_filename, 'w') as f:
+                json.dump(backup_data, f, indent=2)
+            
+            return backup_filename
+        except Exception as e:
+            logging.error(f"Erro ao realizar backup: {e}")
+            st.error(f"Erro ao realizar backup: {e}")
+            return None
+
 class GestaoVendasGoogleSheets:
     def __init__(self):
-        self.creds = autenticar_google()
-        if not self.creds:
-            st.error("Falha na autenticação com Google API.")
-            return
+        self.creds = None
+        self.drive_service = None
+        self.sheets_service = None
+        self.gc = None
+        self.sheets = None
+        self.produtos_sheet = None
+        self.vendas_sheet = None
+        self.autenticado = False
         
-        self.drive_service = build('drive', 'v3', credentials=self.creds)
-        self.sheets_service = build('sheets', 'v4', credentials=self.creds)
-        self.gc = gspread.authorize(self.creds)
-        
-        # Inicializa as planilhas se não existirem
-        self.sheets = self.inicializar_planilhas()
-        if not self.sheets:
-            st.error("Falha ao inicializar planilhas.")
-            return
-        
-        self.produtos_sheet = self.sheets.worksheet("Produtos")
-        self.vendas_sheet = self.sheets.worksheet("Vendas")
-        
-        # Verifica e corrige headers das planilhas se necessário
-        self.verificar_headers()
+        # Tentar autenticar e inicializar
+        try:
+            self.creds = autenticar_google()
+            if self.creds:
+                self.drive_service = build('drive', 'v3', credentials=self.creds)
+                self.sheets_service = build('sheets', 'v4', credentials=self.creds)
+                self.gc = gspread.authorize(self.creds)
+                
+                # Inicializa as planilhas se não existirem
+                self.sheets = self.inicializar_planilhas()
+                if self.sheets:
+                    self.produtos_sheet = self.sheets.worksheet("Produtos")
+                    self.vendas_sheet = self.sheets.worksheet("Vendas")
+                    
+                    # Verifica e corrige headers das planilhas se necessário
+                    self.verificar_headers()
+                    self.autenticado = True
+        except Exception as e:
+            logging.error(f"Erro na inicialização do Google Sheets: {e}")
     
     def inicializar_planilhas(self):
         """Inicializa as planilhas no Google Sheets, criando-as se não existirem."""
@@ -164,7 +523,6 @@ class GestaoVendasGoogleSheets:
             
         except Exception as e:
             logging.error(f"Erro ao inicializar planilhas: {e}")
-            st.error(f"Erro ao inicializar planilhas: {e}")
             return None
     
     def verificar_headers(self):
@@ -202,7 +560,6 @@ class GestaoVendasGoogleSheets:
                 
         except Exception as e:
             logging.error(f"Erro ao verificar headers: {e}")
-            st.error(f"Erro ao verificar headers das planilhas: {e}")
     
     def validar_produto(self, nome, id=None):
         """Verifica se já existe um produto com o mesmo nome."""
@@ -256,7 +613,6 @@ class GestaoVendasGoogleSheets:
             return True
         except Exception as e:
             logging.error(f"Erro ao cadastrar produto: {e}")
-            st.error(f"Erro ao cadastrar produto: {e}")
             return False
     
     def editar_produto(self, id, nome, tipo, valor, quantidade=None, link_download=None, descricao=None):
@@ -290,7 +646,6 @@ class GestaoVendasGoogleSheets:
             return True
         except Exception as e:
             logging.error(f"Erro ao editar produto: {e}")
-            st.error(f"Erro ao editar produto: {e}")
             return False
     
     def remover_produto(self, id):
@@ -310,7 +665,6 @@ class GestaoVendasGoogleSheets:
                 raise ValueError(f"Produto com ID {id} não encontrado")
         except Exception as e:
             logging.error(f"Erro ao remover produto: {e}")
-            st.error(f"Erro ao remover produto: {str(e)}")
             return False
     
     def registrar_venda(self, produto_id, cliente, cpf, email, quantidade, forma_pagamento, data_compra=None):
@@ -368,7 +722,6 @@ class GestaoVendasGoogleSheets:
             return True
         except Exception as e:
             logging.error(f"Erro ao registrar venda: {e}")
-            st.error(f"Erro ao registrar venda: {str(e)}")
             return False
     
     def atualizar_estoque(self, produto_id, nova_quantidade):
@@ -463,7 +816,6 @@ class GestaoVendasGoogleSheets:
             return True
         except Exception as e:
             logging.error(f"Erro ao editar venda: {e}")
-            st.error(f"Erro ao editar venda: {str(e)}")
             return False
     
     def remover_venda(self, id):
@@ -500,7 +852,6 @@ class GestaoVendasGoogleSheets:
                 raise ValueError(f"Venda com ID {id} não encontrada na planilha")
         except Exception as e:
             logging.error(f"Erro ao remover venda: {e}")
-            st.error(f"Erro ao remover venda: {str(e)}")
             return False
     
     def listar_produtos(self):
@@ -527,8 +878,10 @@ class GestaoVendasGoogleSheets:
             return df
         except Exception as e:
             logging.error(f"Erro ao listar produtos: {e}")
-            st.error(f"Erro ao listar produtos: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(columns=[
+                'id', 'nome', 'tipo', 'valor', 'quantidade', 
+                'link_download', 'descricao', 'data_cadastro'
+            ])
     
     def listar_vendas(self):
         """Obtém a lista de vendas da planilha."""
@@ -553,8 +906,11 @@ class GestaoVendasGoogleSheets:
             return df
         except Exception as e:
             logging.error(f"Erro ao listar vendas: {e}")
-            st.error(f"Erro ao listar vendas: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(columns=[
+                'id', 'produto_id', 'produto_nome', 'cliente', 'cpf_cliente',
+                'email_cliente', 'quantidade', 'valor_total', 'forma_pagamento',
+                'data_registro', 'data_compra', 'status'
+            ])
     
     def realizar_backup(self):
         """Exporta os dados para arquivos Excel e cria um backup no Google Drive."""
@@ -587,9 +943,26 @@ class GestaoVendasGoogleSheets:
             return backup_filename
         except Exception as e:
             logging.error(f"Erro ao realizar backup: {e}")
-            st.error(f"Erro ao realizar backup: {e}")
             return None
 
+# Seleciona o gestor de dados apropriado (Google Sheets ou Local)
+def get_gestao():
+    if 'gestao' not in st.session_state:
+        # Tenta inicializar a gestão com Google Sheets
+        gestao_google = GestaoVendasGoogleSheets()
+        
+        # Verifica se a autenticação foi bem-sucedida
+        if gestao_google.autenticado:
+            st.session_state.gestao = gestao_google
+            st.session_state.usando_google = True
+            logging.info("Usando gestão com Google Sheets")
+        else:
+            # Fallback para gestão local
+            st.session_state.gestao = GestaoVendasLocal()
+            st.session_state.usando_google = False
+            logging.info("Usando gestão local (fallback)")
+    
+    return st.session_state.gestao
 
 # Funções da interface do usuário
 def cadastrar_produto_ui(gestao):
@@ -639,7 +1012,7 @@ def registrar_venda_ui(gestao):
     if produtos.empty:
         st.warning("⚠️ Não há produtos cadastrados. Cadastre um produto primeiro.")
         if st.button("➕ Ir para cadastro de produtos"):
-            st.session_state.page = "cadastrar_produto"
+            st.session_state.page = "📦_cadastrar_produto"
             st.rerun()
     else:
         with st.form("registro_venda", clear_on_submit=True):
@@ -714,7 +1087,7 @@ def listar_produtos_ui(gestao):
     if produtos.empty:
         st.warning("⚠️ Nenhum produto cadastrado")
         if st.button("➕ Cadastrar Produto"):
-            st.session_state.page = "cadastrar_produto"
+            st.session_state.page = "📦_cadastrar_produto"
             st.rerun()
     else:
         # Aplicar filtros
@@ -810,531 +1183,54 @@ def listar_produtos_ui(gestao):
                     del st.session_state.editing_product
                     st.rerun()
 
-def listar_vendas_ui(gestao):
-    st.markdown("## 📊 Lista de Vendas")
-    
-    # Adicionar filtros
-    col1, col2, col3 = st.columns([2, 2, 3])
-    
-    with col1:
-        data_inicio = st.date_input("Data inicial", value=datetime.now().replace(day=1))
-    
-    with col2:
-        data_fim = st.date_input("Data final", value=datetime.now())
-    
-    with col3:
-        busca = st.text_input("Buscar por cliente ou produto", placeholder="Digite para buscar...")
-    
-    vendas = gestao.listar_vendas()
-    
-    if vendas.empty:
-        st.warning("⚠️ Nenhuma venda registrada")
-        if st.button("➕ Registrar Venda"):
-            st.session_state.page = "registrar_venda"
-            st.rerun()
-    else:
-        # Converter as colunas de data para datetime
-        vendas['data_compra'] = pd.to_datetime(vendas['data_compra'])
-        
-        # Aplicar filtros
-        vendas_filtradas = vendas[
-            (vendas['data_compra'] >= pd.Timestamp(data_inicio)) & 
-            (vendas['data_compra'] <= pd.Timestamp(data_fim))
-        ]
-        
-        if busca:
-            vendas_filtradas = vendas_filtradas[
-                vendas_filtradas['cliente'].str.contains(busca, case=False) | 
-                vendas_filtradas['produto_nome'].str.contains(busca, case=False)
-            ]
-        
-        # Calcular totais
-        if not vendas_filtradas.empty:
-            total_valor = vendas_filtradas['valor_total'].sum()
-            total_vendas = len(vendas_filtradas)
-            
-            # Mostrar estatísticas
-            st.subheader("📈 Resumo do Período")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Total de Vendas", f"{total_vendas}")
-            
-            with col2:
-                st.metric("Valor Total", f"R$ {total_valor:.2f}")
-            
-            with col3:
-                st.metric("Ticket Médio", f"R$ {(total_valor / total_vendas):.2f}" if total_vendas > 0 else "R$ 0.00")
-            
-            # Gráfico de vendas por dia
-            vendas_por_dia = vendas_filtradas.groupby(vendas_filtradas['data_compra'].dt.date)['valor_total'].sum().reset_index()
-            vendas_por_dia.columns = ['Data', 'Valor Total']
-            
-            # Plotar gráfico de barras
-            fig = px.bar(
-                vendas_por_dia, 
-                x='Data', 
-                y='Valor Total',
-                labels={'valor_total': 'Valor Total (R$)'},
-                title='Vendas Diárias no Período'
-            )
-            fig.update_layout(xaxis_title="Data", yaxis_title="Valor Total (R$)")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Tabela de vendas
-        st.subheader("📝 Detalhes das Vendas")
-        
-        if vendas_filtradas.empty:
-            st.info("Nenhuma venda encontrada para os filtros selecionados.")
-        else:
-            # Formatar dados para exibição
-            vendas_display = vendas_filtradas.copy()
-            vendas_display['data_compra'] = vendas_display['data_compra'].dt.strftime('%d/%m/%Y')
-            vendas_display['valor_total'] = vendas_display['valor_total'].apply(lambda x: f"R$ {x:.2f}")
-            
-            # Exibir vendas
-            for index, row in vendas_filtradas.iterrows():
-                with st.expander(f"Venda #{row['id']} - {row['cliente']} - {pd.to_datetime(row['data_compra']).strftime('%d/%m/%Y')}"):
-                    col1, col2, col3 = st.columns([3, 1, 1])
-                    
-                    with col1:
-                        st.markdown(f"**Cliente:** {row['cliente']}")
-                        st.markdown(f"**Produto:** {row['produto_nome']}")
-                        st.markdown(f"**Quantidade:** {row['quantidade']}")
-                        st.markdown(f"**Valor Total:** R$ {float(row['valor_total']):.2f}")
-                        st.markdown(f"**Forma de Pagamento:** {row['forma_pagamento']}")
-                        
-                        if row['cpf_cliente']:
-                            st.markdown(f"**CPF:** {row['cpf_cliente']}")
-                        
-                        if row['email_cliente']:
-                            st.markdown(f"**Email:** {row['email_cliente']}")
-                    
-                    with col2:
-                        if st.button(f"✏️ Editar", key=f"edit_v_{row['id']}", use_container_width=True):
-                            st.session_state.editing_sale = row['id']
-                    
-                    with col3:
-                        if st.button(f"🗑️ Remover", key=f"remove_v_{row['id']}", use_container_width=True):
-                            if gestao.remover_venda(row['id']):
-                                st.success(f"✅ Venda #{row['id']} removida com sucesso!")
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.error(f"❌ Erro ao remover a venda #{row['id']}")
-            
-            # Modal para edição de venda
-            if 'editing_sale' in st.session_state:
-                venda = vendas_filtradas[vendas_filtradas['id'] == st.session_state.editing_sale].iloc[0]
-                
-                st.markdown(f"### ✏️ Editando Venda #{venda['id']}")
-                
-                with st.form("editar_venda"):
-                    produtos = gestao.listar_produtos()
-                    
-                    # Preparar dados para o dropdown de produtos
-                    produtos['info'] = produtos.apply(lambda x: f"{x['nome']} - R$ {x['valor']:.2f}", axis=1)
-                    opcoes_produtos = dict(zip(produtos['info'], produtos['id']))
-                    
-                    # Encontrar o índice do produto atual
-                    produto_atual = produtos[produtos['id'] == venda['produto_id']]
-                    if not produto_atual.empty:
-                        produto_info_atual = produto_atual['info'].values[0]
-                        idx = list(opcoes_produtos.keys()).index(produto_info_atual)
-                    else:
-                        idx = 0
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        produto_selecionado = st.selectbox("Produto", list(opcoes_produtos.keys()), index=idx)
-                        cliente = st.text_input("Nome do Cliente", value=venda['cliente'])
-                        cpf = st.text_input("CPF do Cliente", value=venda['cpf_cliente'] if venda['cpf_cliente'] else "")
-                    
-                    with col2:
-                        email = st.text_input("Email do Cliente", value=venda['email_cliente'] if venda['email_cliente'] else "")
-                        quantidade = st.number_input("Quantidade", min_value=1, value=int(venda['quantidade']))
-                        forma_pagamento = st.selectbox(
-                            "Forma de Pagamento", 
-                            ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária", "Dinheiro"],
-                            index=["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária", "Dinheiro"].index(venda['forma_pagamento'])
-                            if venda['forma_pagamento'] in ["Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência Bancária", "Dinheiro"] else 0
-                        )
-                    
-                    # Data da compra
-                    data_compra = st.date_input(
-                        "Data da Compra", 
-                        value=pd.to_datetime(venda['data_compra']).date() if pd.notnull(venda['data_compra']) else datetime.now()
-                    )
-                    
-                    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 3])
-                    
-                    with col_btn1:
-                        submit_edit = st.form_submit_button("💾 Atualizar", use_container_width=True)
-                    
-                    with col_btn2:
-                        cancel_edit = st.form_submit_button("❌ Cancelar", use_container_width=True)
-                    
-                    if submit_edit:
-                        produto_id = opcoes_produtos[produto_selecionado]
-                        if gestao.editar_venda(
-                            st.session_state.editing_sale, produto_id, cliente, 
-                            cpf, email, quantidade, forma_pagamento, data_compra
-                        ):
-                            st.success("✅ Venda atualizada com sucesso!")
-                            del st.session_state.editing_sale
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error("❌ Erro ao atualizar a venda")
-                    
-                    if cancel_edit:
-                        del st.session_state.editing_sale
-                        st.rerun()
-
-def backup_ui(gestao):
-    st.markdown("## 💾 Backup e Restauração")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Realizar Backup")
-        st.markdown("Crie um backup dos seus dados e salve-o no Google Drive.")
-        
-        if st.button("🔄 Iniciar Backup", use_container_width=True):
-            with st.spinner("Realizando backup..."):
-                try:
-                    backup_file = gestao.realizar_backup()
-                    if backup_file:
-                        st.success(f"✅ Backup realizado com sucesso! Arquivo '{backup_file}' salvo no Google Drive.")
-                        st.balloons()
-                    else:
-                        st.error("❌ Erro ao realizar backup.")
-                except Exception as e:
-                    logging.error(f"Erro ao realizar backup: {e}")
-                    st.error(f"❌ Erro ao realizar backup: {e}")
-
-def visualizar_planilha_ui(gestao):
-    st.markdown("## 👀 Visualizar Dados")
-    
-    # Tabs para diferentes visualizações
-    tab1, tab2, tab3 = st.tabs(["📊 Tabelas", "📈 Gráficos", "💰 Financeiro"])
-    
-    with tab1:
-        tipo = st.radio("Selecione o tipo de dados", ["Produtos", "Vendas"], horizontal=True)
-        
-        if tipo == "Produtos":
-            df = gestao.listar_produtos()
-            
-            if not df.empty:
-                # Ajustar colunas para exibição
-                df_display = df.copy()
-                df_display['valor'] = df_display['valor'].apply(lambda x: f"R$ {float(x):.2f}")
-                
-                # Ocultar colunas menos importantes
-                colunas_exibir = ['id', 'nome', 'tipo', 'valor', 'quantidade']
-                if 'data_cadastro' in df_display.columns:
-                    colunas_exibir.append('data_cadastro')
-                
-                st.dataframe(
-                    df_display[colunas_exibir],
-                    column_config={
-                        "id": "ID",
-                        "nome": "Nome do Produto",
-                        "tipo": "Tipo",
-                        "valor": "Valor",
-                        "quantidade": "Estoque",
-                        "data_cadastro": "Data de Cadastro"
-                    },
-                    use_container_width=True
-                )
-                
-                # Opção para exportar
-                if st.button("📥 Exportar para Excel"):
-                    with st.spinner("Gerando arquivo..."):
-                        buffer = io.BytesIO()
-                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                            df.to_excel(writer, sheet_name='Produtos', index=False)
-                        
-                        st.download_button(
-                            label="📥 Baixar Excel",
-                            data=buffer.getvalue(),
-                            file_name=f"MEDIX_Produtos_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-            else:
-                st.warning("⚠️ Nenhum produto cadastrado")
-        
-        else:  # Vendas
-            df = gestao.listar_vendas()
-            
-            if not df.empty:
-                # Ajustar colunas para exibição
-                df_display = df.copy()
-                df_display['valor_total'] = df_display['valor_total'].apply(lambda x: f"R$ {float(x):.2f}")
-                df_display['data_compra'] = pd.to_datetime(df_display['data_compra']).dt.strftime('%d/%m/%Y')
-                if 'data_registro' in df_display.columns:
-                    df_display['data_registro'] = pd.to_datetime(df_display['data_registro']).dt.strftime('%d/%m/%Y %H:%M')
-                
-                # Ocultar colunas menos importantes
-                colunas_exibir = ['id', 'produto_nome', 'cliente', 'quantidade', 'valor_total', 'forma_pagamento', 'data_compra']
-                
-                st.dataframe(
-                    df_display[colunas_exibir],
-                    column_config={
-                        "id": "ID",
-                        "produto_nome": "Produto",
-                        "cliente": "Cliente",
-                        "quantidade": "Qtd",
-                        "valor_total": "Valor Total",
-                        "forma_pagamento": "Pagamento",
-                        "data_compra": "Data da Compra"
-                    },
-                    use_container_width=True
-                )
-                
-                # Opção para exportar
-                if st.button("📥 Exportar para Excel"):
-                    with st.spinner("Gerando arquivo..."):
-                        buffer = io.BytesIO()
-                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                            df.to_excel(writer, sheet_name='Vendas', index=False)
-                        
-                        st.download_button(
-                            label="📥 Baixar Excel",
-                            data=buffer.getvalue(),
-                            file_name=f"MEDIX_Vendas_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-            else:
-                st.warning("⚠️ Nenhuma venda registrada")
-    
-    with tab2:
-        if gestao.listar_vendas().empty:
-            st.warning("⚠️ Nenhuma venda registrada para gerar gráficos.")
-        else:
-            chart_type = st.selectbox(
-                "Selecione o tipo de gráfico",
-                ["Vendas por Período", "Produtos Mais Vendidos", "Formas de Pagamento", "Valor vs Quantidade"]
-            )
-            
-            vendas = gestao.listar_vendas()
-            vendas['data_compra'] = pd.to_datetime(vendas['data_compra'])
-            
-            if chart_type == "Vendas por Período":
-                periodo = st.radio("Agrupar por:", ["Dia", "Mês", "Ano"], horizontal=True)
-                
-                if periodo == "Dia":
-                    vendas_agrupadas = vendas.groupby(vendas['data_compra'].dt.date)['valor_total'].sum().reset_index()
-                    vendas_agrupadas.columns = ['Data', 'Valor Total']
-                    
-                    fig = px.bar(
-                        vendas_agrupadas, 
-                        x='Data', 
-                        y='Valor Total',
-                        title='Vendas Diárias',
-                        labels={'Valor Total': 'Valor Total (R$)'}
-                    )
-                
-                elif periodo == "Mês":
-                    vendas['mes_ano'] = vendas['data_compra'].dt.strftime('%Y-%m')
-                    vendas_agrupadas = vendas.groupby('mes_ano')['valor_total'].sum().reset_index()
-                    vendas_agrupadas.columns = ['Mês/Ano', 'Valor Total']
-                    
-                    fig = px.bar(
-                        vendas_agrupadas, 
-                        x='Mês/Ano', 
-                        y='Valor Total',
-                        title='Vendas Mensais',
-                        labels={'Valor Total': 'Valor Total (R$)'}
-                    )
-                
-                else:  # Ano
-                    vendas_agrupadas = vendas.groupby(vendas['data_compra'].dt.year)['valor_total'].sum().reset_index()
-                    vendas_agrupadas.columns = ['Ano', 'Valor Total']
-                    
-                    fig = px.bar(
-                        vendas_agrupadas, 
-                        x='Ano', 
-                        y='Valor Total',
-                        title='Vendas Anuais',
-                        labels={'Valor Total': 'Valor Total (R$)'}
-                    )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            elif chart_type == "Produtos Mais Vendidos":
-                top_n = st.slider("Número de produtos", 3, 10, 5)
-                
-                # Agrupar por produto e somar quantidades
-                produtos_vendidos = vendas.groupby('produto_nome')['quantidade'].sum().reset_index()
-                produtos_vendidos = produtos_vendidos.sort_values('quantidade', ascending=False).head(top_n)
-                
-                fig = px.bar(
-                    produtos_vendidos,
-                    x='produto_nome',
-                    y='quantidade',
-                    title=f'Top {top_n} Produtos Mais Vendidos',
-                    labels={'produto_nome': 'Produto', 'quantidade': 'Quantidade Vendida'}
-                )
-                fig.update_layout(xaxis_title="Produto", yaxis_title="Quantidade Vendida")
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            elif chart_type == "Formas de Pagamento":
-                # Agrupar por forma de pagamento
-                pagamentos = vendas.groupby('forma_pagamento')['valor_total'].sum().reset_index()
-                
-                fig = px.pie(
-                    pagamentos,
-                    values='valor_total',
-                    names='forma_pagamento',
-                    title='Distribuição de Formas de Pagamento',
-                    hole=0.4
-                )
-                
-                fig.update_traces(textposition='inside', textinfo='percent+label')
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            elif chart_type == "Valor vs Quantidade":
-                # Scatter plot de valor vs quantidade
-                fig = px.scatter(
-                    vendas,
-                    x='quantidade',
-                    y='valor_total',
-                    color='produto_nome',
-                    size='quantidade',
-                    hover_name='cliente',
-                    title='Relação entre Quantidade e Valor Total por Produto',
-                    labels={'quantidade': 'Quantidade', 'valor_total': 'Valor Total (R$)', 'produto_nome': 'Produto'}
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-    
-    with tab3:
-        if gestao.listar_vendas().empty:
-            st.warning("⚠️ Nenhuma venda registrada para análise financeira.")
-        else:
-            st.subheader("💰 Análise Financeira")
-            
-            # Filtros de período
-            col1, col2 = st.columns(2)
-            with col1:
-                data_inicio = st.date_input("Data inicial", value=datetime.now().replace(day=1))
-            with col2:
-                data_fim = st.date_input("Data final", value=datetime.now())
-            
-            vendas = gestao.listar_vendas()
-            vendas['data_compra'] = pd.to_datetime(vendas['data_compra'])
-            
-            # Filtrar por período
-            vendas_periodo = vendas[
-                (vendas['data_compra'] >= pd.Timestamp(data_inicio)) & 
-                (vendas['data_compra'] <= pd.Timestamp(data_fim))
-            ]
-            
-            if vendas_periodo.empty:
-                st.info("Não há vendas no período selecionado.")
-            else:
-                # Calcular métricas financeiras
-                receita_total = vendas_periodo['valor_total'].sum()
-                total_vendas = len(vendas_periodo)
-                ticket_medio = receita_total / total_vendas if total_vendas > 0 else 0
-                
-                # Valor médio por produto
-                valor_por_produto = vendas_periodo.groupby('produto_nome')['valor_total'].sum().reset_index()
-                top_produto = valor_por_produto.sort_values('valor_total', ascending=False).iloc[0]['produto_nome']
-                valor_top_produto = valor_por_produto.sort_values('valor_total', ascending=False).iloc[0]['valor_total']
-                
-                # Exibir métricas
-                st.subheader("📊 Resumo Financeiro")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Receita Total", f"R$ {receita_total:.2f}")
-                with col2:
-                    st.metric("Número de Vendas", f"{total_vendas}")
-                with col3:
-                    st.metric("Ticket Médio", f"R$ {ticket_medio:.2f}")
-                
-                # Mais insights
-                st.subheader("🔍 Insights")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Produto Mais Rentável", top_produto, f"R$ {valor_top_produto:.2f}")
-                
-                with col2:
-                    # Forma de pagamento mais utilizada
-                    pagamento_mais_usado = vendas_periodo['forma_pagamento'].value_counts().index[0]
-                    porcentagem_pagamento = (vendas_periodo['forma_pagamento'].value_counts().iloc[0] / total_vendas) * 100
-                    st.metric("Forma de Pagamento Mais Usada", pagamento_mais_usado, f"{porcentagem_pagamento:.1f}%")
-                
-                # Gráfico de evolução de receita
-                st.subheader("📈 Evolução da Receita")
-                
-                # Agrupar por dia
-                receita_diaria = vendas_periodo.groupby(vendas_periodo['data_compra'].dt.date)['valor_total'].sum().reset_index()
-                
-                # Calcular média móvel de 7 dias
-                if len(receita_diaria) > 7:
-                    receita_diaria['media_movel'] = receita_diaria['valor_total'].rolling(window=7, min_periods=1).mean()
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(
-                        x=receita_diaria['data_compra'],
-                        y=receita_diaria['valor_total'],
-                        name='Receita Diária',
-                        marker_color='lightblue'
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=receita_diaria['data_compra'],
-                        y=receita_diaria['media_movel'],
-                        name='Média Móvel (7 dias)',
-                        line=dict(color='red', width=2)
-                    ))
-                    fig.update_layout(
-                        title='Evolução da Receita Diária',
-                        xaxis_title='Data',
-                        yaxis_title='Receita (R$)',
-                        legend=dict(x=0, y=1.1, orientation='h')
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    fig = px.bar(
-                        receita_diaria,
-                        x='data_compra',
-                        y='valor_total',
-                        title='Evolução da Receita Diária',
-                        labels={'data_compra': 'Data', 'valor_total': 'Receita (R$)'}
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
 def configuracoes_ui(gestao):
     st.markdown("## ⚙️ Configurações")
     
+    usando_google = st.session_state.get('usando_google', False)
+    
     st.subheader("🔐 Acesso ao Google Drive")
-    st.markdown("""
-    O sistema está configurado para salvar os dados na seguinte pasta do Google Drive:
     
-    **Pasta:** [Gestão Produtos](https://drive.google.com/drive/folders/1HDN1suMspx1um0xbK34waXZ5VGUmseB6)
-    
-    Todos os dados de produtos e vendas são armazenados em tempo real em planilhas do Google Sheets 
-    dentro desta pasta, garantindo acesso fácil e segurança de backup automático.
-    """)
-    
-    st.subheader("🎨 Personalização")
-    
-    # Tema da aplicação
-    tema = st.selectbox(
-        "Tema da aplicação",
-        ["Padrão", "Claro", "Escuro", "Azul Médico"],
-        index=0
-    )
-    
-    if tema != "Padrão":
-        st.info("A mudança de tema será implementada na próxima atualização.")
+    if usando_google:
+        st.success("✅ Conectado ao Google Drive")
+        st.markdown("""
+        O sistema está configurado para salvar os dados na seguinte pasta do Google Drive:
+        
+        **Pasta:** [Gestão Produtos](https://drive.google.com/drive/folders/1HDN1suMspx1um0xbK34waXZ5VGUmseB6)
+        
+        Todos os dados de produtos e vendas são armazenados em tempo real em planilhas do Google Sheets 
+        dentro desta pasta, garantindo acesso fácil e segurança de backup automático.
+        """)
+    else:
+        st.warning("⚠️ Usando armazenamento local (modo offline)")
+        st.markdown("""
+        O sistema está usando armazenamento local para salvar os dados.
+        
+        Para ativar a sincronização com o Google Drive, você precisa configurar as credenciais corretas.
+        """)
+        
+        # Opção para criar secretos
+        if st.button("📝 Gerar Template de Credenciais"):
+            with st.expander("Configuração das Credenciais"):
+                st.code("""
+[gcp_service_account]
+type = "service_account"
+project_id = "medix-system"
+private_key_id = "YOUR_PRIVATE_KEY_ID"
+private_key = "-----BEGIN PRIVATE KEY-----\\nYOUR_PRIVATE_KEY_HERE\\n-----END PRIVATE KEY-----\\n"
+client_email = "medix-service@medix-system.iam.gserviceaccount.com"
+client_id = "1072458931980-mpf2loc5b26l3j5ke1hf0fhghnrfv6i1.apps.googleusercontent.com"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/medix-service%40medix-system.iam.gserviceaccount.com"
+                """, language="toml")
+                
+                st.markdown("""
+                1. Copie este template
+                2. No Streamlit Cloud, vá para Configurações > Secrets
+                3. Cole o template e substitua os valores
+                4. Clique em Save
+                """)
     
     # Informações do Sistema
     st.subheader("ℹ️ Informações do Sistema")
@@ -1347,19 +1243,178 @@ def configuracoes_ui(gestao):
         st.markdown("**Desenvolvido por:** MEDIX Team")
     
     with col2:
-        st.markdown("**Status:** Conectado ao Google Drive")
-        st.markdown("**Armazenamento:** Google Sheets")
+        st.markdown(f"**Status:** {'Conectado ao Google Drive' if usando_google else 'Modo Offline'}")
+        st.markdown(f"**Armazenamento:** {'Google Sheets' if usando_google else 'Arquivo Local'}")
         st.markdown("**Suporte:** suporte@medix.com")
     
     # Botão para testar conexão
     if st.button("🔄 Testar Conexão com Google Drive"):
         with st.spinner("Testando conexão..."):
             try:
-                # Tentar obter as planilhas para testar a conexão
-                gestao.inicializar_planilhas()
-                st.success("✅ Conexão bem sucedida! O sistema está conectado ao Google Drive.")
+                # Criar uma instância temporária para testar
+                gestao_test = GestaoVendasGoogleSheets()
+                if gestao_test.autenticado:
+                    st.success("✅ Conexão bem sucedida! O sistema está conectado ao Google Drive.")
+                    # Atualizar a sessão
+                    st.session_state.gestao = gestao_test
+                    st.session_state.usando_google = True
+                    st.rerun()
+                else:
+                    st.error("❌ Falha na conexão. Verifique as credenciais.")
             except Exception as e:
                 st.error(f"❌ Falha na conexão: {e}")
+
+def dashboard_ui(gestao):
+    st.title("📊 Dashboard - MEDIX")
+    
+    # Visão geral dos dados
+    produtos = gestao.listar_produtos()
+    vendas = gestao.listar_vendas()
+    
+    # Métricas principais
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total de Produtos", len(produtos) if not produtos.empty else 0)
+    
+    with col2:
+        st.metric("Total de Vendas", len(vendas) if not vendas.empty else 0)
+    
+    with col3:
+        receita_total = vendas['valor_total'].sum() if not vendas.empty else 0
+        st.metric("Receita Total", f"R$ {receita_total:.2f}")
+    
+    with col4:
+        if not vendas.empty and len(vendas) > 0:
+            ticket_medio = receita_total / len(vendas)
+            st.metric("Ticket Médio", f"R$ {ticket_medio:.2f}")
+        else:
+            st.metric("Ticket Médio", "R$ 0.00")
+    
+    # Gráficos do dashboard
+    if not vendas.empty:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📈 Vendas Recentes")
+            
+            # Convertendo data para datetime se necessário
+            if 'data_compra' in vendas.columns:
+                try:
+                    vendas['data_compra'] = pd.to_datetime(vendas['data_compra'])
+                    
+                    # Últimos 30 dias
+                    data_limite = pd.Timestamp.now() - pd.Timedelta(days=30)
+                    vendas_recentes = vendas[vendas['data_compra'] >= data_limite]
+                    
+                    if not vendas_recentes.empty:
+                        vendas_por_dia = vendas_recentes.groupby(vendas_recentes['data_compra'].dt.date)['valor_total'].sum().reset_index()
+                        vendas_por_dia.columns = ['Data', 'Valor']
+                        
+                        fig = px.line(
+                            vendas_por_dia, 
+                            x='Data', 
+                            y='Valor',
+                            title='Vendas nos Últimos 30 Dias',
+                            labels={'Valor': 'Valor Total (R$)'}
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Não há vendas nos últimos 30 dias.")
+                except Exception as e:
+                    st.error(f"Erro ao processar datas: {e}")
+                    st.info("Não foi possível gerar o gráfico de vendas recentes.")
+            else:
+                st.info("Dados de data não disponíveis.")
+        
+        with col2:
+            st.subheader("🔝 Produtos Mais Vendidos")
+            try:
+                produtos_vendidos = vendas.groupby('produto_nome')['quantidade'].sum().reset_index()
+                produtos_vendidos = produtos_vendidos.sort_values('quantidade', ascending=False).head(5)
+                
+                if not produtos_vendidos.empty:
+                    fig = px.bar(
+                        produtos_vendidos,
+                        y='produto_nome',
+                        x='quantidade',
+                        title='Top 5 Produtos Mais Vendidos',
+                        labels={'produto_nome': 'Produto', 'quantidade': 'Quantidade Vendida'},
+                        orientation='h'
+                    )
+                    fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Não há produtos vendidos ainda.")
+            except Exception as e:
+                st.error(f"Erro ao processar dados de produtos: {e}")
+                st.info("Não foi possível gerar o gráfico de produtos mais vendidos.")
+    
+    # Alertas de estoque
+    st.subheader("⚠️ Alertas de Estoque")
+    if not produtos.empty:
+        try:
+            produtos_fisicos = produtos[produtos['tipo'].isin(['Card', 'Material Físico'])]
+            
+            if not produtos_fisicos.empty:
+                # Filtrar produtos com estoque baixo (menos de 5 unidades)
+                baixo_estoque = produtos_fisicos[produtos_fisicos['quantidade'] < 5]
+                
+                if not baixo_estoque.empty:
+                    st.warning("Produtos com estoque baixo (menos de 5 unidades):")
+                    for _, produto in baixo_estoque.iterrows():
+                        st.info(f"{produto['nome']} - Estoque atual: {produto['quantidade']} unidades")
+                else:
+                    st.success("Todos os produtos possuem estoque adequado.")
+            else:
+                st.info("Não há produtos físicos cadastrados.")
+        except Exception as e:
+            st.error(f"Erro ao processar alertas de estoque: {e}")
+            st.info("Não foi possível verificar alertas de estoque.")
+    else:
+        st.info("Não há produtos cadastrados.")
+
+def menu_principal():
+    # Usar option_menu se disponível, caso contrário, usar um seletor padrão
+    if option_menu_available:
+        with st.sidebar:
+            menu = option_menu(
+                "Menu Principal",
+                [
+                    "📊 Dashboard",
+                    "📦 Cadastrar Produto", 
+                    "💳 Registrar Venda", 
+                    "📋 Listar Produtos", 
+                    "📊 Listar Vendas",
+                    "⚙️ Configurações"
+                ],
+                icons=[
+                    "house", 
+                    "box-seam", 
+                    "credit-card", 
+                    "list-check", 
+                    "graph-up", 
+                    "gear"
+                ],
+                menu_icon="cast",
+                default_index=0,
+            )
+        return menu
+    else:
+        with st.sidebar:
+            st.title("MEDIX - Menu")
+            menu = st.radio(
+                "Selecione uma opção:",
+                [
+                    "📊 Dashboard",
+                    "📦 Cadastrar Produto", 
+                    "💳 Registrar Venda", 
+                    "📋 Listar Produtos", 
+                    "📊 Listar Vendas",
+                    "⚙️ Configurações"
+                ]
+            )
+        return menu
 
 def main():
     # Configuração da página
@@ -1398,243 +1453,101 @@ def main():
         background-color: #2980b9;
     }
     
-    /* Containers */
-    .css-1r6slb0 {
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    
-    /* Expanders */
-    .streamlit-expanderHeader {
-        background-color: #f1f8fe;
-        border-radius: 5px;
-    }
-    
-    /* Metrics */
-    [data-testid="stMetricValue"] {
-        font-size: 1.8rem !important;
-        font-weight: 700 !important;
-        color: #2c3e50 !important;
-    }
-    
-    [data-testid="stMetricDelta"] {
-        font-size: 1rem !important;
-        font-weight: 500 !important;
-    }
-    
-    /* Menu lateral */
-    .css-1d391kg {
-        background-color: #2c3e50;
-    }
-    
     /* Footer */
     footer {
         visibility: hidden;
     }
-    
-    /* Formulários */
-    .stForm {
-        background-color: white;
-        padding: 1.5rem;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-    }
-    
-    /* Alertas e mensagens */
-    .stAlert {
-        border-radius: 5px;
-    }
     </style>
     """, unsafe_allow_html=True)
     
-    # Inicializar sessão
-    if 'page' not in st.session_state:
-        st.session_state.page = "home"
-    
-    if 'gestao' not in st.session_state:
-        st.session_state.gestao = GestaoVendasGoogleSheets()
-    
-    gestao = st.session_state.gestao
-    
-    # Sidebar com menu
+    # Logo e título no sidebar
     with st.sidebar:
-        # Logo
-        st.image("https://i.imgur.com/gKyBL7S.png", width=100)
         st.title("🩺 MEDIX")
         st.caption("Sistema de Gestão de Produtos e Vendas")
-        
-        # Menu de navegação
-        menu = option_menu(
-            "Menu Principal",
-            [
-                "📊 Dashboard",
-                "📦 Cadastrar Produto", 
-                "💳 Registrar Venda", 
-                "📋 Listar Produtos", 
-                "📊 Listar Vendas",
-                "👀 Visualizar Dados",
-                "💾 Backup",
-                "⚙️ Configurações"
-            ],
-            icons=[
-                "house", 
-                "box-seam", 
-                "credit-card", 
-                "list-check", 
-                "graph-up", 
-                "eye", 
-                "cloud-arrow-up", 
-                "gear"
-            ],
-            menu_icon="cast",
-            default_index=0,
-        )
-        
-        st.session_state.page = menu.lower().replace(" ", "_")
-        
-        # Informações de uso
         st.markdown("---")
-        st.caption("Dados armazenados no Google Drive")
-        st.caption("© 2023 MEDIX Health Systems")
     
-    # Conteúdo principal
-    if st.session_state.page == "📊_dashboard":
-        st.title("📊 Dashboard - MEDIX")
-        
-        # Visão geral dos dados
-        produtos = gestao.listar_produtos()
-        vendas = gestao.listar_vendas()
-        
-        # Métricas principais
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total de Produtos", len(produtos) if not produtos.empty else 0)
-        
-        with col2:
-            st.metric("Total de Vendas", len(vendas) if not vendas.empty else 0)
-        
-        with col3:
-            receita_total = vendas['valor_total'].sum() if not vendas.empty else 0
-            st.metric("Receita Total", f"R$ {receita_total:.2f}")
-        
-        with col4:
-            if not vendas.empty and len(vendas) > 0:
-                ticket_medio = receita_total / len(vendas)
-                st.metric("Ticket Médio", f"R$ {ticket_medio:.2f}")
-            else:
-                st.metric("Ticket Médio", "R$ 0.00")
-        
-        # Gráficos do dashboard
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("📈 Vendas Recentes")
-            if not vendas.empty:
-                # Converter data_compra para datetime
-                vendas['data_compra'] = pd.to_datetime(vendas['data_compra'])
-                
-                # Agrupar por dia para os últimos 30 dias
-                data_limite = pd.Timestamp.now() - pd.Timedelta(days=30)
-                vendas_recentes = vendas[vendas['data_compra'] >= data_limite]
-                
-                if not vendas_recentes.empty:
-                    vendas_por_dia = vendas_recentes.groupby(vendas_recentes['data_compra'].dt.date)['valor_total'].sum().reset_index()
-                    vendas_por_dia.columns = ['Data', 'Valor']
-                    
-                    fig = px.line(
-                        vendas_por_dia, 
-                        x='Data', 
-                        y='Valor',
-                        title='Vendas nos Últimos 30 Dias',
-                        labels={'Valor': 'Valor Total (R$)'}
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Não há vendas nos últimos 30 dias.")
-            else:
-                st.info("Não há vendas registradas.")
-        
-        with col2:
-            st.subheader("🔝 Produtos Mais Vendidos")
-            if not vendas.empty:
-                produtos_vendidos = vendas.groupby('produto_nome')['quantidade'].sum().reset_index()
-                produtos_vendidos = produtos_vendidos.sort_values('quantidade', ascending=False).head(5)
-                
-                if not produtos_vendidos.empty:
-                    fig = px.bar(
-                        produtos_vendidos,
-                        y='produto_nome',
-                        x='quantidade',
-                        title='Top 5 Produtos Mais Vendidos',
-                        labels={'produto_nome': 'Produto', 'quantidade': 'Quantidade Vendida'},
-                        orientation='h'
-                    )
-                    fig.update_layout(yaxis={'categoryorder': 'total ascending'})
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Não há produtos vendidos ainda.")
-            else:
-                st.info("Não há vendas registradas.")
-        
-        # Alertas de estoque
-        st.subheader("⚠️ Alertas de Estoque")
-        if not produtos.empty:
-            produtos_fisicos = produtos[produtos['tipo'].isin(['Card', 'Material Físico'])]
-            
-            if not produtos_fisicos.empty:
-                # Filtrar produtos com estoque baixo (menos de 5 unidades)
-                baixo_estoque = produtos_fisicos[produtos_fisicos['quantidade'] < 5]
-                
-                if not baixo_estoque.empty:
-                    st.warning("Produtos com estoque baixo (menos de 5 unidades):")
-                    for _, produto in baixo_estoque.iterrows():
-                        st.info(f"{produto['nome']} - Estoque atual: {produto['quantidade']} unidades")
-                else:
-                    st.success("Todos os produtos possuem estoque adequado.")
-            else:
-                st.info("Não há produtos físicos cadastrados.")
-        else:
-            st.info("Não há produtos cadastrados.")
-        
-        # Últimas vendas
-        st.subheader("📝 Últimas Vendas")
-        if not vendas.empty:
-            ultimas_vendas = vendas.sort_values('data_registro', ascending=False).head(5)
-            
-            for _, venda in ultimas_vendas.iterrows():
-                col1, col2, col3 = st.columns([3, 1, 1])
-                
-                with col1:
-                    st.write(f"**{venda['cliente']}** - {venda['produto_nome']}")
-                
-                with col2:
-                    st.write(f"R$ {float(venda['valor_total']):.2f}")
-                
-                with col3:
-                    st.write(pd.to_datetime(venda['data_compra']).strftime('%d/%m/%Y'))
-                
-                st.markdown("---")
-        else:
-            st.info("Não há vendas registradas.")
+    # Inicializar a gestão (Google ou Local)
+    gestao = get_gestao()
     
-    elif st.session_state.page == "📦_cadastrar_produto":
+    # Menu principal
+    menu = menu_principal()
+    
+    # Conteúdo principal com base no menu selecionado
+    if menu == "📊 Dashboard":
+        dashboard_ui(gestao)
+    
+    elif menu == "📦 Cadastrar Produto":
         cadastrar_produto_ui(gestao)
     
-    elif st.session_state.page == "💳_registrar_venda":
+    elif menu == "💳 Registrar Venda":
         registrar_venda_ui(gestao)
     
-    elif st.session_state.page == "📋_listar_produtos":
+    elif menu == "📋 Listar Produtos":
         listar_produtos_ui(gestao)
     
-    elif st.session_state.page == "📊_listar_vendas":
-        listar_vendas_ui(gestao)
+    elif menu == "📊 Listar Vendas":
+        st.title("Lista de Vendas")
+        st.info("Esta funcionalidade está simplificada para debug. A implementação completa será adicionada em breve.")
+        
+        vendas = gestao.listar_vendas()
+        if not vendas.empty:
+            st.dataframe(vendas)
+        else:
+            st.warning("Não há vendas registradas.")
     
-    elif st.session_state.page == "👀_visualizar_dados":
-        visualizar_planilha_ui(gestao)
-    
-    elif st.session_state.page == "💾_backup":
-        backup_ui(gestao)
-    
-    elif st.session_state.page == "⚙️_configurações":
+    elif menu == "⚙️ Configurações":
         configuracoes_ui(gestao)
+    
+    # Rodapé
+    with st.sidebar:
+        st.markdown("---")
+        storage_type = "Google Drive" if st.session_state.get('usando_google', False) else "Local"
+        st.caption(f"Armazenamento: {storage_type}")
+        st.caption("© 2025 MEDIX Health Systems")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        st.error(f"Erro inesperado: {e}")
+        logging.error(f"Erro inesperado na aplicação: {e}")
+        
+        # Fallback para uma interface simplificada
+        st.title("MEDIX - Modo de Emergência")
+        st.warning("O sistema encontrou um erro e está funcionando em modo limitado.")
+        
+        basic_option = st.selectbox(
+            "O que você gostaria de fazer?",
+            ["Ver informações", "Verificar configurações"]
+        )
+        
+        if basic_option == "Ver informações":
+            st.info("MEDIX - Sistema de Gestão de Produtos e Vendas")
+            st.markdown("""
+            Para resolver este problema:
+            1. Verifique as credenciais do Google
+            2. Reinstale as dependências necessárias
+            3. Reinicie a aplicação
+            """)
+        
+        elif basic_option == "Verificar configurações":
+            st.subheader("Diagnóstico do Sistema")
+            
+            st.markdown("**Verificando importações:**")
+            try:
+                import gspread
+                st.success("✅ gspread importado com sucesso")
+            except ImportError:
+                st.error("❌ gspread não encontrado")
+            
+            try:
+                from google.oauth2.service_account import Credentials
+                st.success("✅ google.oauth2 importado com sucesso")
+            except ImportError:
+                st.error("❌ google.oauth2 não encontrado")
+            
+            try:
+                from streamlit_option_menu import option_menu
+                st.success("✅ streamlit_option_menu importado com sucesso")
+            except ImportError:
+                st.error("❌ streamlit_option_menu não encontrado")
